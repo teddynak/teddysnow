@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: compliance-auditor
+  servlet:
+    multipart:
+      max-file-size: 8MB
+      max-request-size: 10MB
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://localhost:27017/compliance_auditor}
+
+app:
+  cors:
+    allowed-origins: ${CORS_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}

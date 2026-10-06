@@ -1,0 +1,60 @@
+name: Document Compliance Audit
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  compliance-audit:
+    name: Audit OpenAPI Specs, Logs & Documentation
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build & Start Compliance Auditor Engine
+        run: |
+          cd backend
+          ./mvnw spring-boot:start
+          # Wait for health check
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/api/health; do sleep 2; done'
+          cd ..
+
+      - name: Audit OpenAPI Spec & Export SARIF
+        run: |
+          chmod +x cli/audit.sh
+          ./cli/audit.sh samples/openapi-spec.yaml --format sarif -o openapi-results.sarif --fail-on error || true
+
+      - name: Audit Technical Documentation & Export SARIF
+        run: |
+          ./cli/audit.sh samples/framework-documentation.md --format sarif -o docs-results.sarif --fail-on error || true
+
+      - name: Upload OpenAPI Audit SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: openapi-results.sarif
+          category: compliance-openapi
+
+      - name: Upload Documentation Audit SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: docs-results.sarif
+          category: compliance-documentation
