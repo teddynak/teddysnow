@@ -101,107 +101,79 @@ export interface RulebookJsonSchema {
   properties?: Record<string, JsonSchemaProperty>;
 }
 
-const API = "/api";
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = "ApiError"; }
+}
 
-async function parse<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    let message = `Request failed (${response.status})`;
-    try {
-      const body = (await response.json()) as { error?: string; message?: string };
-      if (body.error) {
-        message = body.error;
-      } else if (body.message) {
-        message = body.message;
-      }
-    } catch {
-      /* ignore */
+export const API = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+
+async function checkedResponse<T>(path: string, init: RequestInit | undefined, read: (response: Response) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch(`${API}${path}`, { ...init, signal: controller.signal });
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`;
+      if (response.status === 413) message = "The file is too large. Maximum upload size is 8 MB.";
+      try {
+        const body = await response.json() as { error?: string; message?: string };
+        message = body.message || body.error || message;
+      } catch { /* A proxy may return an empty or HTML error page. */ }
+      throw new ApiError(message, response.status);
     }
-    throw new Error(message);
+    return await read(response);
+  } catch (error) {
+    if (controller.signal.aborted) throw new ApiError("The backend took too long to respond. Check the API and database, then retry.", 0);
+    if (error instanceof TypeError) throw new ApiError("Cannot reach the backend. Check that the API is running and the API URL is configured correctly.", 0);
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  if (response.status === 204) {
-    return null as unknown as T;
-  }
-  return (await response.json()) as T;
 }
 
-export async function listRulebooks(): Promise<Rulebook[]> {
-  return parse(await fetch(`${API}/rulebooks`));
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return checkedResponse(path, init, async response => {
+    const text = await response.text();
+    if (!text) return undefined as T;
+    try { return JSON.parse(text) as T; }
+    catch { throw new ApiError("The server returned an unexpected response. Check the API URL and proxy configuration.", 0); }
+  });
 }
 
-export async function getRulebook(id: string): Promise<Rulebook> {
-  return parse(await fetch(`${API}/rulebooks/${id}`));
-}
+const jsonBody = (body: unknown, method = "POST"): RequestInit => ({
+  method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+});
+const idPath = (id: string) => encodeURIComponent(id);
 
-export async function saveRulebook(rulebook: Rulebook): Promise<Rulebook> {
-  const method = rulebook.id ? "PUT" : "POST";
-  const url = rulebook.id ? `${API}/rulebooks/${rulebook.id}` : `${API}/rulebooks`;
-  return parse(
-    await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(rulebook),
-    }),
-  );
-}
+export const getHealth = () => request<{ status: string }>("/health");
+export const listRulebooks = () => request<Rulebook[]>("/rulebooks");
+export const getRulebook = (id: string) => request<Rulebook>(`/rulebooks/${idPath(id)}`);
+export const getEffectiveRulebook = (id: string) => request<Rulebook>(`/rulebooks/${idPath(id)}/effective`);
+export const validateRulebook = (rulebook: Rulebook) => request<Rulebook>("/rulebooks/validate", jsonBody(rulebook));
+export const saveRulebook = (rulebook: Rulebook) => request<Rulebook>(
+  rulebook.id ? `/rulebooks/${idPath(rulebook.id)}` : "/rulebooks",
+  jsonBody(rulebook, rulebook.id ? "PUT" : "POST"),
+);
+export const deleteRulebook = (id: string) => request<void>(`/rulebooks/${idPath(id)}`, { method: "DELETE" });
+export const resetRulebooks = () => request<Rulebook[]>("/rulebooks/reset", { method: "POST" });
+export const getRulebookSchema = () => request<RulebookJsonSchema>("/rulebooks/schema");
 
-export async function deleteRulebook(id: string): Promise<void> {
-  await parse(await fetch(`${API}/rulebooks/${id}`, { method: "DELETE" }));
-}
+export const scanPasted = (content: string, rulebookId?: string, sourceName?: string, customRulebook?: Rulebook) =>
+  request<ScanRecord>("/scans", jsonBody({ content, rulebookId, sourceName, customRulebook }));
 
-export async function resetRulebooks(): Promise<Rulebook[]> {
-  return parse(await fetch(`${API}/rulebooks/reset`, { method: "POST" }));
-}
-
-export async function getRulebookSchema(): Promise<RulebookJsonSchema> {
-  return parse(await fetch(`${API}/rulebooks/schema`));
-}
-
-export async function scanPasted(
-  content: string,
-  rulebookId?: string,
-  sourceName?: string,
-  customRulebook?: Rulebook,
-): Promise<ScanRecord> {
-  return parse(
-    await fetch(`${API}/scans`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, rulebookId, sourceName, customRulebook }),
-    }),
-  );
-}
-
-export async function scanUpload(file: File, rulebookId?: string): Promise<ScanRecord> {
+export function scanUpload(file: File, rulebookId?: string): Promise<ScanRecord> {
   const form = new FormData();
   form.append("file", file);
   const query = rulebookId ? `?rulebookId=${encodeURIComponent(rulebookId)}` : "";
-  return parse(await fetch(`${API}/scans/upload${query}`, { method: "POST", body: form }));
+  return request(`/scans/upload${query}`, { method: "POST", body: form });
 }
 
-export async function listScans(): Promise<ScanSummary[]> {
-  return parse(await fetch(`${API}/scans`));
-}
-
-export async function getScan(id: string): Promise<ScanRecord> {
-  return parse(await fetch(`${API}/scans/${id}`));
-}
-
-export async function deleteScan(id: string): Promise<void> {
-  await parse(await fetch(`${API}/scans/${id}`, { method: "DELETE" }));
-}
-
-export async function clearAllScans(): Promise<void> {
-  await parse(await fetch(`${API}/scans`, { method: "DELETE" }));
-}
-
-export async function getEffectiveRulebook(id: string): Promise<Rulebook> {
-  return parse(await fetch(`${API}/rulebooks/${id}/effective`));
-}
-
-export async function getSarifExport(id: string): Promise<Record<string, unknown>> {
-  return parse(await fetch(`${API}/scans/${id}/sarif`));
-}
-
-export function exportScanUrl(id: string, format: "sarif" | "markdown" | "json"): string {
-  return `${API}/scans/${id}/export?format=${format}`;
-}
+export const listScans = () => request<ScanSummary[]>("/scans");
+export const getScan = (id: string) => request<ScanRecord>(`/scans/${idPath(id)}`);
+export const deleteScan = (id: string) => request<void>(`/scans/${idPath(id)}`, { method: "DELETE" });
+export const clearAllScans = () => request<void>("/scans", { method: "DELETE" });
+export const getSarifExport = (id: string) => request<Record<string, unknown>>(`/scans/${idPath(id)}/sarif`);
+export const exportScanUrl = (id: string, format: "sarif" | "markdown" | "json") =>
+  `${API}/scans/${idPath(id)}/export?format=${format}`;
+export const downloadScanReport = async (id: string, format: "sarif" | "markdown" | "json") =>
+  checkedResponse(`/scans/${idPath(id)}/export?format=${format}`, undefined, response => response.blob());

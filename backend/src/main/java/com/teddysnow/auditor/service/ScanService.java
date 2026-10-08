@@ -40,9 +40,9 @@ public class ScanService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Document content is empty");
         }
         Rulebook rulebook;
-        if (customRulebook != null && customRulebook.getRules() != null && !customRulebook.getRules().isEmpty()) {
+        if (customRulebook != null) {
             rulebookService.validateRulebook(customRulebook);
-            rulebook = customRulebook;
+            rulebook = rulebookService.resolveEffectiveHierarchy(customRulebook, new java.util.HashSet<>());
             if (rulebook.getId() == null || rulebook.getId().isBlank()) {
                 rulebook.setId("in-memory-rulebook");
             }

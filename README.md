@@ -22,13 +22,13 @@ An intelligent compliance auditing tool for developers and platform engineers to
 
 ---
 
-## Live Services Status
+## Local Service Addresses
 
-| Service | Port | Status | Description |
-|---|---|---|---|
-| **React UI (Vite)** | `http://localhost:5173` | **ONLINE** | Interactive compliance auditor UI |
-| **Spring Boot API** | `http://localhost:8080` | **ONLINE** | Compliance engine & MongoDB REST API |
-| **MongoDB Database** | `mongodb://localhost:27017` | **ONLINE** | `compliance_auditor` database |
+| Service | Address | Description |
+|---|---|---|
+| **React UI (Vite)** | `http://localhost:5173` | Interactive compliance auditor UI |
+| **Spring Boot API** | `http://localhost:8080` | Compliance engine & MongoDB REST API |
+| **MongoDB Database** | `mongodb://localhost:27017` | `compliance_auditor` database |
 
 ---
 
@@ -54,6 +54,38 @@ npm install
 npm run dev
 ```
 *(Accessible at `http://localhost:5173`)*
+
+---
+
+## Frontend Configuration and Verification
+
+The frontend checks API health and loads rulebooks, scan history, and schema independently. Use **Refresh connection** after starting or reconnecting services. Uploads accept UTF-8 text documents up to 8 MB and run an audit immediately. The Studio can create, save, validate, and test drafts without saving them; validation uses the backend's Java regex and inheritance checks.
+
+Copy `frontend/.env.example` to `frontend/.env.local` to customize the connection:
+
+- `API_PROXY_TARGET` configures the backend target for both Vite development and preview servers; default `http://localhost:8080`.
+- `VITE_API_BASE_URL` configures the browser API path at build time; default `/api`. A deployed frontend needs either a reverse proxy for `/api` or an absolute backend API URL such as `https://auditor.example/api`. For a separate origin, set the backend's `CORS_ORIGINS` to the frontend URL.
+
+```bash
+cd frontend
+npm run typecheck
+npm run build
+npm audit
+npx playwright install chromium
+npm test
+```
+
+The default browser suite verifies service failures, recovery, clipboard errors, duplicate submissions, and destructive-action wiring with controlled API responses. To also run real API checks for scanning, exports, history, uploads, studio save/update, inherited drafts, and responsive views, start a backend connected to an **isolated test database**, then run:
+
+```bash
+AUDITOR_API_URL=http://localhost:8080 API_PROXY_TARGET=http://localhost:8080 npm test
+```
+
+To test the production build, run `npm run build` and add `PLAYWRIGHT_PREVIEW=1` to the browser test command. Development uses port 5173 and standalone preview uses 4173; both local origins are allowed by the backend defaults. Browser tests start their own server on 5173 and reject a port already used by another app. Set `PLAYWRIGHT_PORT` and the backend `CORS_ORIGINS` together if you need another test port.
+
+The live tests create and remove their own scan and rulebook records. Layout checks cover 320, 375, 768, 1024, and 1440 pixel widths. Browser screenshots and failure traces are written to `frontend/test-results/`. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use an existing Chromium or Chrome executable.
+
+Run backend tests with Java 21 using `cd backend && ./mvnw test`.
 
 ---
 
@@ -97,6 +129,7 @@ On boot, the compliance engine automatically seeds three production rulebooks:
 - `GET /api/rulebooks` — List all active rulebooks in MongoDB
 - `GET /api/rulebooks/{id}` — Get rulebook by ID
 - `GET /api/rulebooks/{id}/effective` — Get rulebook with full inherited rules merged
+- `POST /api/rulebooks/validate` — Validate a draft and return merged inherited rules without saving
 - `POST /api/rulebooks` — Create rulebook with strict JSON schema validation & inheritance (`extendsRulebookId`)
 - `PUT /api/rulebooks/{id}` — Update rulebook with strict JSON schema validation & inheritance
 - `DELETE /api/rulebooks/{id}` — Delete rulebook

@@ -36,12 +36,19 @@ public class RulebookController {
         return rulebookService.create(rulebook);
     }
 
+    @PostMapping("/validate")
+    public Rulebook validate(@RequestBody Rulebook rulebook) {
+        rulebookService.validateRulebook(rulebook);
+        return rulebookService.resolveEffectiveHierarchy(rulebook, new java.util.HashSet<>());
+    }
+
     @PutMapping("/{id}")
     public Rulebook update(@PathVariable String id, @RequestBody Rulebook rulebook) {
         return rulebookService.update(id, rulebook);
     }
 
     @DeleteMapping("/{id}")
+    @ResponseStatus(org.springframework.http.HttpStatus.NO_CONTENT)
     public void delete(@PathVariable String id) {
         rulebookService.delete(id);
     }

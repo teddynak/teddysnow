@@ -7,3 +7,8 @@ target
 .DS_Store
 .data
 *.sarif
+
+frontend/test-results/
+frontend/playwright-report/
+frontend/.env.local
+!samples/system.log

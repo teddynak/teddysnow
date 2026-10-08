@@ -62,7 +62,7 @@ public class RulebookService {
 
         Rulebook parent = rulebookRepository.findById(current.getExtendsRulebookId()).orElse(null);
         if (parent == null) {
-            return current;
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Extended parent rulebook not found");
         }
 
         Rulebook effectiveParent = resolveEffectiveHierarchy(parent, visited);
@@ -113,6 +113,7 @@ public class RulebookService {
                     .ifPresent(p -> incoming.setExtendsRulebookName(p.getName()));
         }
         validateRulebook(incoming);
+        resolveEffectiveHierarchy(incoming, new HashSet<>());
         return rulebookRepository.save(incoming);
     }
 
@@ -131,11 +132,16 @@ public class RulebookService {
         }
         existing.setUpdatedAt(Instant.now());
         validateRulebook(existing);
+        resolveEffectiveHierarchy(existing, new HashSet<>());
         return rulebookRepository.save(existing);
     }
 
     public void delete(String id) {
         Rulebook existing = get(id);
+        if (rulebookRepository.findAll().stream().anyMatch(book -> id.equals(book.getExtendsRulebookId()))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "This rulebook is inherited by another rulebook. Remove that inheritance before deleting it.");
+        }
         rulebookRepository.delete(existing);
     }
 
@@ -300,7 +306,7 @@ public class RulebookService {
 
         Map<String, Object> rulesArray = new LinkedHashMap<>();
         rulesArray.put("type", "array");
-        rulesArray.put("minItems", 1);
+        rulesArray.put("minItems", 0);
         rulesArray.put("items", Map.of(
                 "type", "object",
                 "required", List.of("id", "title", "severity", "type", "message"),
@@ -309,6 +315,10 @@ public class RulebookService {
 
         properties.put("rules", rulesArray);
         schema.put("properties", properties);
+        schema.put("anyOf", List.of(
+                Map.of("required", List.of("rules"), "properties", Map.of("rules", Map.of("minItems", 1))),
+                Map.of("required", List.of("extendsRulebookId"), "properties", Map.of("extendsRulebookId", Map.of("type", "string", "minLength", 1)))
+        ));
         return schema;
     }
 }

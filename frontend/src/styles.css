@@ -1482,3 +1482,73 @@ mark.violation-mark.info {
     padding: 7px 11px;
   }
 }
+
+/* Keep long document lines and controls inside their panels at every viewport. */
+.shell, main, .workspace-grid > *, .rulebook-studio-layout > *, .panel,
+.brand, .brand > div:last-child, .editor-container, .score-stats,
+.document-viewer, .history-table-container, .cicd-grid > * {
+  min-width: 0;
+}
+.workspace-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); }
+.rulebook-studio-layout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.workspace-controls { padding: 0; border: 0; margin: 0; min-width: 0; }
+.workspace-controls:disabled .dropzone { opacity: .55; cursor: wait; }
+.connection-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: -6px 0 20px; color: var(--muted); font-size: 12px; }
+.header-status { flex-shrink: 0; max-width: 220px; }
+.status-dot.unavailable { background: var(--error); box-shadow: none; }
+.status-dot.checking { background: var(--warning); box-shadow: none; }
+.scorecard { display: flex; flex-wrap: wrap; gap: 16px; }
+.score-stats { flex: 1 1 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.compliance-gauge-wrapper { min-width: 0; grid-column: 1 / -1; }
+.violation-navigator { flex-wrap: wrap; }
+.doc-viewer-header, .editor-header-bar { flex-wrap: wrap; gap: 8px; }
+.doc-viewer-header span, .finding-title, .finding-message, .finding-suggestion span,
+.status-badge, .rule-card, .banner span, .panel-title h2 { overflow-wrap: anywhere; }
+.doc-viewer-header > span:first-child { min-width: 0; flex: 1 1 180px; }
+.panel-title { flex-wrap: wrap; }
+.panel-title select { max-width: 100%; min-width: 0; flex: 1 1 220px; }
+.rule-card-header { flex-wrap: wrap; gap: 8px; }
+.finding-badges { flex-wrap: wrap; min-width: 0; }
+.finding-excerpt { padding-right: 42px; overflow-wrap: anywhere; }
+.banner { flex-wrap: wrap; }
+.banner svg { flex-shrink: 0; }
+input, select, textarea { max-width: 100%; min-width: 0; }
+.btn svg, .tab-btn svg { flex-shrink: 0; }
+button, input, select, textarea { font: inherit; }
+:where(button, input, select, textarea, a, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+.skip-link { position: fixed; left: 16px; top: -80px; z-index: 1000; padding: 10px 16px; background: var(--panel-elevated); color: var(--ink); border: 1px solid var(--accent); border-radius: 8px; }
+.skip-link:focus { top: 12px; }
+.inheritance-control { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 10px 0 14px; padding: 8px 12px; background: var(--panel-elevated); border-radius: 6px; border: 1px solid var(--line); }
+.inheritance-control select { flex: 1 1 180px; }
+
+@media (max-width: 1024px) {
+  .workspace-grid, .rulebook-studio-layout { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 768px) {
+  .header-status { max-width: none; }
+  .tabs { flex-wrap: wrap; }
+  .tab-btn { flex: 1 1 calc(50% - 6px); justify-content: center; white-space: normal; }
+  .studio-actions, .studio-view-tabs, .nav-export-group { flex-wrap: wrap; overflow: visible; }
+  .studio-actions .btn, .studio-view-tabs .btn { flex: 1 1 auto; justify-content: center; }
+  .btn, .btn-sm, .filter-pill, .preset-chip, .line-jump-btn { min-height: 40px; }
+}
+@media (max-width: 580px) {
+  .tab-btn { font-size: 12px; padding: 9px 8px; }
+  .score-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .status-badge-lg { font-size: 12px; padding: 9px 12px; }
+  .filter-pills { flex-wrap: wrap; overflow: visible; }
+  .finding-badges { justify-content: flex-start; }
+  .connection-toolbar .btn { width: 100%; justify-content: center; }
+  input, select, textarea { font-size: 16px; }
+  .editor-textarea { font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+.excerpt-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px; margin-bottom: 8px; }
+.excerpt-row .finding-excerpt { padding-right: 11px; margin-bottom: 0; min-height: 32px; }

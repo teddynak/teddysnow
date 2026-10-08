@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import {
+  ApiError,
   clearAllScans,
   deleteRulebook,
   deleteScan,
   getEffectiveRulebook,
   getRulebookSchema,
-  getSarifExport,
+  downloadScanReport,
+  getHealth,
+  validateRulebook,
   getScan,
   listRulebooks,
   listScans,
@@ -21,6 +24,7 @@ import {
   type ScanSummary,
   type Severity,
 } from "./api";
+import { cliCommand, curlCommand, workflowYaml } from "./ci";
 import { SAMPLE_PRESETS, type SamplePreset } from "./samples";
 import {
   ShieldCheck,
@@ -65,6 +69,12 @@ export default function App() {
   const [scan, setScan] = useState<ScanRecord | null>(null);
   const [history, setHistory] = useState<ScanSummary[]>([]);
   const [busy, setBusy] = useState<boolean>(false);
+  const [operationLabel, setOperationLabel] = useState("Loading catalog…");
+  const [apiStatus, setApiStatus] = useState("checking");
+  const [databaseStatus, setDatabaseStatus] = useState("checking");
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const taskRunning = useRef(false);
+  const draftMode = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
 
@@ -88,61 +98,170 @@ export default function App() {
   } | null>(null);
 
   // CI/CD Generator State
+  const [ciRulebookId, setCiRulebookId] = useState("");
+  const [ciServer, setCiServer] = useState("http://localhost:8080");
   const [ciTargetFile, setCiTargetFile] = useState<string>("samples/openapi-spec.yaml");
   const [ciFormat, setCiFormat] = useState<"sarif" | "json" | "markdown" | "terminal">("sarif");
   const [ciFailOn, setCiFailOn] = useState<"error" | "warning">("error");
   const [copiedCiSnippet, setCopiedCiSnippet] = useState<string | null>(null);
 
+  const ciRulebook = rulebooks.find(book => book.id === ciRulebookId);
+  const generatedCli = cliCommand(ciTargetFile, ciRulebookId, ciFormat, ciFailOn);
+  const generatedCurl = curlCommand(ciTargetFile, ciRulebookId, ciServer);
+  const generatedWorkflow = workflowYaml(ciTargetFile, ciRulebook?.name || "", ciFailOn);
+  useEffect(() => {
+    const hint = ciTargetFile.includes("openapi") ? "OpenAPI" : ciTargetFile.includes("framework") ? "Framework" : "Platform log";
+    setCiRulebookId(rulebooks.find(book => book.name.includes(hint))?.id || "");
+  }, [ciTargetFile, rulebooks]);
+
   // Refs for auto-scrolling
   const codeViewerRef = useRef<HTMLDivElement>(null);
   const findingsListRef = useRef<HTMLDivElement>(null);
+  const notificationTimer = useRef<ReturnType<typeof setTimeout>>();
+  const copyTimer = useRef<ReturnType<typeof setTimeout>>();
 
   const selectedRulebook = useMemo(() => {
     return rulebooks.find((book) => book.id === selectedRulebookId);
   }, [rulebooks, selectedRulebookId]);
 
-  // Load Rulebooks, Scans, and Schema on initial render
-  async function refreshCatalog() {
-    setBusy(true);
+  const studioRulebook = useMemo(() => {
     try {
-      const [books, scans, schema] = await Promise.all([
-        listRulebooks(),
-        listScans(),
-        getRulebookSchema().catch(() => null),
-      ]);
-      setRulebooks(books);
-      setHistory(scans);
-      if (schema) setSchemaDoc(schema);
+      const value: unknown = JSON.parse(ruleJson);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const parsed = value as Record<string, unknown>;
+      const rules = Array.isArray(parsed.rules) ? parsed.rules.filter(rule =>
+        rule && typeof rule === "object" && typeof rule.id === "string" && typeof rule.title === "string" &&
+        typeof rule.message === "string" && ["ERROR", "WARNING", "INFO"].includes(rule.severity) &&
+        typeof rule.type === "string" && ["suggestion", "category", "pattern", "triggerPattern", "requiredPattern", "minVersion", "inheritedFrom"].every(key => rule[key] == null || typeof rule[key] === "string") && (!rule.tokens || (Array.isArray(rule.tokens) && rule.tokens.every((token: unknown) => typeof token === "string")))
+      ) as ComplianceRule[] : [];
+      return {
+        name: typeof parsed.name === "string" ? parsed.name : "Untitled draft",
+        description: typeof parsed.description === "string" ? parsed.description : "",
+        version: typeof parsed.version === "string" ? parsed.version : "",
+        extendsRulebookId: typeof parsed.extendsRulebookId === "string" ? parsed.extendsRulebookId : "",
+        extendsRulebookName: typeof parsed.extendsRulebookName === "string" ? parsed.extendsRulebookName : "",
+        rules,
+      };
+    } catch { return null; }
+  }, [ruleJson]);
 
-      if (books.length > 0 && !selectedRulebookId) {
-        // Default to Framework Documentation rulebook if present
-        const frameworkBook = books.find((b) => b.name.includes("Framework")) || books[0];
-        setSelectedRulebookId(frameworkBook.id || "");
-        setRuleJson(JSON.stringify(frameworkBook, null, 2));
+  function refreshConnection() {
+    if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+        !confirm("Refresh the catalog and discard unsaved rulebook edits?")) return;
+    void runTask("Refreshing connection…", refreshCatalog);
+  }
+
+  function notify(message: string) {
+    clearTimeout(notificationTimer.current);
+    setSuccessBanner(message);
+    notificationTimer.current = setTimeout(() => setSuccessBanner(null), 4000);
+  }
+
+  async function runTask(label: string, task: () => Promise<void>) {
+    if (taskRunning.current) return;
+    taskRunning.current = true;
+    setBusy(true);
+    setOperationLabel(label);
+    setError(null);
+    setSuccessBanner(null);
+    try { await task(); }
+    catch (err) {
+      setError(err instanceof Error ? err.message : "The request failed. Please retry.");
+      if (err instanceof ApiError && (err.status === 0 || err.status >= 500)) {
+        setDatabaseStatus("unavailable");
+        if (err.status !== 500) setApiStatus("unavailable");
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load database catalog");
-    } finally {
-      setBusy(false);
     }
+    finally { taskRunning.current = false; setBusy(false); }
+  }
+
+  async function copyText(text: string, message: string, snippet?: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setError(null);
+      notify(message);
+      if (snippet) {
+        clearTimeout(copyTimer.current);
+        setCopiedCiSnippet(snippet);
+        copyTimer.current = setTimeout(() => setCopiedCiSnippet(null), 2500);
+      }
+    } catch { setError("Clipboard access failed. Select and copy the text manually."); }
+  }
+
+  // Each service loads independently; a history or schema failure does not hide rulebooks.
+  async function refreshCatalog() {
+    const results = await Promise.allSettled([getHealth(), listRulebooks(), listScans(), getRulebookSchema()]);
+    const [healthResult, booksResult, scansResult, schemaResult] = results;
+    setApiStatus(healthResult.status === "fulfilled" && healthResult.value.status === "ok" ? "connected" : "unavailable");
+    setDatabaseStatus(booksResult.status === "fulfilled" && scansResult.status === "fulfilled" ? "connected" : "unavailable");
+    if (booksResult.status === "fulfilled") {
+      const books = booksResult.value;
+      setRulebooks(books);
+      setSelectedRulebookId(current => {
+        if (draftMode.current || books.some(book => book.id === current)) return current;
+        const preset = SAMPLE_PRESETS.find(item => item.id === activePresetId);
+        return (preset ? books.find(book => book.name.toLowerCase().includes(preset.rulebookHint.toLowerCase())) : books[0])?.id || "";
+      });
+    }
+    if (scansResult.status === "fulfilled") { setHistory(scansResult.value); setHistoryLoaded(true); }
+    if (schemaResult.status === "fulfilled") setSchemaDoc(schemaResult.value);
+    const failures = results.flatMap((result, index) => result.status === "rejected"
+      ? [`${["API health", "Rulebooks", "Scan history", "Rulebook schema"][index]}: ${result.reason instanceof Error ? result.reason.message : "Unavailable"}`] : []);
+    if (failures.length) setError(failures.join(" · "));
   }
 
   useEffect(() => {
-    void refreshCatalog();
+    void runTask("Loading catalog…", refreshCatalog);
+    return () => { clearTimeout(notificationTimer.current); clearTimeout(copyTimer.current); };
   }, []);
 
-  // Sync ruleJson when user selects a different rulebook from dropdown
   useEffect(() => {
+    let cancelled = false;
+    setSchemaValidationResult(null);
+    setShowEffectiveRules(false);
+    setEffectiveRules([]);
     if (selectedRulebook) {
       setRuleJson(JSON.stringify(selectedRulebook, null, 2));
-      setSchemaValidationResult(null);
       if (selectedRulebook.id) {
         getEffectiveRulebook(selectedRulebook.id)
-          .then((eff) => setEffectiveRules(eff.rules || []))
-          .catch(() => setEffectiveRules(selectedRulebook.rules || []));
+          .then(eff => { if (!cancelled) setEffectiveRules(eff.rules || []); })
+          .catch(err => { if (!cancelled) setError(`Could not load inherited rules: ${err instanceof Error ? err.message : "Request failed"}`); });
       }
     }
-  }, [selectedRulebookId]);
+    return () => { cancelled = true; };
+  }, [selectedRulebook]);
+
+  function selectRulebook(id: string) {
+    if (id === selectedRulebookId) return;
+    if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+        !confirm("Discard your unsaved rulebook changes and switch rulebooks?")) return;
+    draftMode.current = false;
+    setSelectedRulebookId(id);
+  }
+
+  function newRulebook() {
+    if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+        !confirm("Discard your unsaved rulebook changes and create a new rulebook?")) return;
+    draftMode.current = true;
+    setSelectedRulebookId("");
+    setRuleJson(JSON.stringify({
+      name: "Custom compliance rulebook", description: "Document policy checks", version: "1.0.0",
+      rules: [{ id: "require-framework", title: "Framework metadata", message: "Include a Framework metadata header.",
+        suggestion: "Add Framework: React 18+ to your document.", category: "Metadata", severity: "ERROR",
+        type: "DOCUMENT_REQUIRED", enabled: true, pattern: "(?i)framework:" }],
+    }, null, 2));
+    setStudioView("editor");
+  }
+
+  function readStudioRulebook(): Rulebook {
+    const parsed: unknown = JSON.parse(ruleJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Rulebook JSON must be an object.");
+    return parsed as Rulebook;
+  }
+
+  function resetResultFilters() {
+    setSeverityFilter("ALL"); setCategoryFilter("ALL"); setSearchQuery(""); setShowOnlyViolations(false);
+  }
 
   // Auto-scroll when active line changes
   useEffect(() => {
@@ -154,355 +273,186 @@ export default function App() {
     }
   }, [activeLine]);
 
-  // Load Sample Preset
   function handleSelectPreset(preset: SamplePreset) {
-    setActivePresetId(preset.id);
-    setContent(preset.content);
-    setSourceName(preset.filename);
-    const matchingRulebook = rulebooks.find(
-      (b) => b.name.toLowerCase().includes(preset.rulebookHint.toLowerCase()) ||
-             preset.rulebookHint.toLowerCase().includes(b.name.toLowerCase())
-    );
-    if (matchingRulebook?.id) {
-      setSelectedRulebookId(matchingRulebook.id);
+    const matchingRulebook = rulebooks.find(book => book.name.toLowerCase().includes(preset.rulebookHint.toLowerCase()));
+    const nextId = matchingRulebook?.id || "";
+    if (nextId !== selectedRulebookId) {
+      if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+          !confirm("Discard unsaved rulebook changes and use this preset's rulebook?")) return;
+      draftMode.current = false;
+      setSelectedRulebookId(nextId);
+      if (!nextId) setRuleJson("");
     }
-    setScan(null);
-    setActiveLine(null);
-    setSuccessBanner(`Loaded preset: ${preset.name}`);
-    setTimeout(() => setSuccessBanner(null), 3000);
+    setActivePresetId(preset.id); setContent(preset.content); setSourceName(preset.filename);
+    setScan(null); setActiveLine(null); resetResultFilters();
+    if (matchingRulebook) { setError(null); notify(`Loaded preset: ${preset.name}`); }
+    else setError(`The ${preset.name} preset's rulebook is unavailable. Restore defaults in the Studio or choose a saved rulebook before auditing.`);
   }
 
-  // Handle Drag & Drop Upload
-  function handleDragOver(e: DragEvent<HTMLLabelElement>) {
-    e.preventDefault();
-    setDragOver(true);
-  }
-
-  function handleDragLeave(e: DragEvent<HTMLLabelElement>) {
-    e.preventDefault();
-    setDragOver(false);
-  }
-
+  function handleDragOver(e: DragEvent<HTMLLabelElement>) { e.preventDefault(); if (!busy) setDragOver(true); }
+  function handleDragLeave(e: DragEvent<HTMLLabelElement>) { e.preventDefault(); setDragOver(false); }
   function handleDrop(e: DragEvent<HTMLLabelElement>) {
-    e.preventDefault();
-    setDragOver(false);
+    e.preventDefault(); setDragOver(false);
     const file = e.dataTransfer.files?.[0];
-    if (file) {
-      processUploadedFile(file);
-    }
+    if (file && !taskRunning.current) processUploadedFile(file);
   }
-
   function handleFileInput(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (file) {
-      processUploadedFile(file);
-    }
+    e.target.value = "";
+    if (file) processUploadedFile(file);
   }
-
   function processUploadedFile(file: File) {
-    setSourceName(file.name);
-    file.text().then((text) => {
-      setContent(text);
-      setSuccessBanner(`Uploaded file: ${file.name} (${text.split("\n").length} lines)`);
-      setTimeout(() => setSuccessBanner(null), 3500);
-      void executeScan(scanUpload(file, selectedRulebookId || undefined));
-    }).catch((err) => {
-      setError(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
+    void runTask("Uploading and scanning…", async () => {
+      if (!selectedRulebookId) throw new Error("Select a saved rulebook before uploading a document.");
+      if (!/\.(log|txt|json|yaml|yml|md|csv|conf)$/i.test(file.name)) throw new Error("Choose a supported text file (.log, .txt, .md, .json, .yaml, .yml, .csv, .conf).");
+      if (file.size > 8 * 1024 * 1024) throw new Error("The file is too large. Maximum upload size is 8 MB.");
+      const text = await file.text();
+      if (!text.trim()) throw new Error("The uploaded document is empty.");
+      if (text.includes("\0") || text.includes("\ufffd")) throw new Error("Upload a UTF-8 text document.");
+      setContent(text); setSourceName(file.name); setActivePresetId(""); setScan(null);
+      await executeScan(() => scanUpload(file, selectedRulebookId));
     });
   }
 
-  // Execute Scan
-  async function executeScan(scanPromise: Promise<ScanRecord>) {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await scanPromise;
-      setScan(result);
-      if (result.findings.length > 0) {
-        setActiveLine(result.findings[0].lineNumber);
-      } else {
-        setActiveLine(null);
-      }
-      setHistory(await listScans());
-      setTab("auditor");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Compliance scan failed");
-    } finally {
-      setBusy(false);
-    }
+  async function refreshHistory() {
+    try { setHistory(await listScans()); setHistoryLoaded(true); }
+    catch (err) { setError(`The action succeeded, but scan history could not refresh: ${err instanceof Error ? err.message : "Request failed"}`); }
   }
 
-  // Trigger Pasted Content Scan
+  async function executeScan(request: () => Promise<ScanRecord>) {
+    const result = await request();
+    setScan(result); setActiveLine(result.findings[0]?.lineNumber ?? null);
+    resetResultFilters(); setTab("auditor");
+    await refreshHistory();
+  }
+
   function triggerScan() {
-    if (!content.trim()) {
-      setError("Please paste or upload document content to audit.");
-      return;
-    }
-    void executeScan(scanPasted(content, selectedRulebookId || undefined, sourceName));
+    void runTask("Scanning document…", async () => {
+      if (!content.trim()) throw new Error("Please paste or upload document content to audit.");
+      if (!selectedRulebookId) throw new Error("Select a saved rulebook, or test a draft with Studio Rules.");
+      await executeScan(() => scanPasted(content, selectedRulebookId, sourceName));
+    });
   }
 
-  // Trigger Scan using in-progress Studio JSON rulebook (in-memory test)
   function triggerStudioTestScan() {
-    try {
-      const parsed = JSON.parse(ruleJson) as Rulebook;
-      void executeScan(scanPasted(content, undefined, sourceName, parsed));
-    } catch (err) {
-      setError(`Invalid Rulebook JSON: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    void runTask("Testing Studio rules…", async () => {
+      if (!content.trim()) throw new Error("Add document content before testing your rules.");
+      const parsed = readStudioRulebook();
+      await executeScan(() => scanPasted(content, undefined, sourceName, parsed));
+    });
   }
 
-  // Save Rulebook to MongoDB
-  async function handleSaveRulebook() {
-    setBusy(true);
-    setError(null);
-    try {
-      const parsed = JSON.parse(ruleJson) as Rulebook;
+  function handleSaveRulebook() {
+    void runTask("Saving rulebook…", async () => {
+      const parsed = readStudioRulebook();
+      // The selected database record determines update identity, rather than an editable JSON id.
+      if (selectedRulebookId) parsed.id = selectedRulebookId; else delete parsed.id;
       const saved = await saveRulebook(parsed);
-      setSuccessBanner(`Rulebook '${saved.name}' saved to MongoDB successfully!`);
-      setTimeout(() => setSuccessBanner(null), 4000);
-      await refreshCatalog();
-      if (saved.id) setSelectedRulebookId(saved.id);
-      setRuleJson(JSON.stringify(saved, null, 2));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save rulebook to MongoDB");
-    } finally {
-      setBusy(false);
-    }
+      draftMode.current = false;
+      setRulebooks(books => [...books.filter(book => book.id !== saved.id), saved]);
+      setSelectedRulebookId(saved.id || ""); setRuleJson(JSON.stringify(saved, null, 2));
+      if (scan?.rulebookId === saved.id) { setScan(null); setActiveLine(null); }
+      notify(`Saved rulebook: ${saved.name}`);
+    });
   }
 
-  // Delete Rulebook
-  async function handleDeleteRulebook() {
-    if (!selectedRulebook?.id) return;
-    if (!confirm(`Are you sure you want to delete rulebook "${selectedRulebook.name}"?`)) return;
-
-    setBusy(true);
-    try {
-      await deleteRulebook(selectedRulebook.id);
-      setSuccessBanner(`Deleted rulebook: ${selectedRulebook.name}`);
-      setTimeout(() => setSuccessBanner(null), 3000);
-      const books = await listRulebooks();
-      setRulebooks(books);
-      setSelectedRulebookId(books[0]?.id || "");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete rulebook");
-    } finally {
-      setBusy(false);
-    }
+  function handleDeleteRulebook() {
+    if (!selectedRulebook?.id || !confirm(`Delete rulebook "${selectedRulebook.name}"?`)) return;
+    const id = selectedRulebook.id;
+    void runTask("Deleting rulebook…", async () => {
+      await deleteRulebook(id);
+      const books = rulebooks.filter(book => book.id !== id);
+      setRulebooks(books); setSelectedRulebookId(books[0]?.id || "");
+      if (!books.length) { setRuleJson(""); setEffectiveRules([]); }
+      notify("Rulebook deleted.");
+    });
   }
 
-  // Reset Factory Rulebooks in MongoDB
-  async function handleResetRulebooks() {
-    if (!confirm("Reset all compliance rulebooks in MongoDB to factory defaults?")) return;
-    setBusy(true);
-    try {
+  function handleResetRulebooks() {
+    if (!confirm("Restore the seeded rulebooks to their default rules? Custom rulebooks are retained.")) return;
+    void runTask("Restoring defaults…", async () => {
       const books = await resetRulebooks();
-      setRulebooks(books);
-      setSelectedRulebookId(books[0]?.id || "");
-      setRuleJson(JSON.stringify(books[0], null, 2));
-      setSuccessBanner("Factory default rulebooks successfully restored in MongoDB!");
-      setTimeout(() => setSuccessBanner(null), 4000);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reset rulebooks");
-    } finally {
-      setBusy(false);
-    }
+      draftMode.current = false; setRulebooks(books);
+      setSelectedRulebookId((books.find(book => book.name.includes("Framework")) || books[0])?.id || "");
+      setScan(null); setActiveLine(null);
+      notify("Default rulebooks restored.");
+    });
   }
 
-  // Format Rulebook JSON
   function formatRuleJson() {
-    try {
-      const parsed = JSON.parse(ruleJson);
-      setRuleJson(JSON.stringify(parsed, null, 2));
-      setSchemaValidationResult({ valid: true, errors: [] });
-    } catch (err) {
-      setError(`JSON Syntax Error: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    try { setRuleJson(JSON.stringify(readStudioRulebook(), null, 2)); setSchemaValidationResult(null); notify("JSON formatted. Use Validate to check the rules."); }
+    catch (err) { setError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`); }
   }
 
-  // Validate JSON against Strict Schema
   function validateJsonAgainstSchema() {
-    try {
-      const parsed = JSON.parse(ruleJson) as Rulebook;
-      const errors: string[] = [];
-
-      if (!parsed.name || parsed.name.trim().length < 2) {
-        errors.push("Missing or invalid 'name' (minimum 2 characters required)");
-      }
-      if (!parsed.version || !/^[0-9]+(\.[0-9]+)*$/.test(parsed.version)) {
-        errors.push("Missing or invalid 'version' (semantic version format e.g. 1.0.0 required)");
-      }
-      if (parsed.extendsRulebookId && parsed.id && parsed.extendsRulebookId === parsed.id) {
-        errors.push("Rulebook cannot extend itself");
-      }
-      const hasExtends = Boolean(parsed.extendsRulebookId && parsed.extendsRulebookId.trim().length > 0);
-      if ((!parsed.rules || !Array.isArray(parsed.rules) || parsed.rules.length === 0) && !hasExtends) {
-        errors.push("Rulebook must contain a non-empty 'rules' array or extend a parent rulebook");
-      } else if (parsed.rules && Array.isArray(parsed.rules)) {
-        const idSet = new Set<string>();
-        parsed.rules.forEach((rule, idx) => {
-          const prefix = `Rule #${idx + 1}`;
-          if (!rule.id || !/^[a-zA-Z0-9_-]{2,60}$/.test(rule.id)) {
-            errors.push(`${prefix}: 'id' must be 2-60 alphanumeric characters with hyphens/underscores`);
-          } else if (idSet.has(rule.id)) {
-            errors.push(`${prefix}: duplicate rule id '${rule.id}'`);
-          } else {
-            idSet.add(rule.id);
-          }
-          if (!rule.title?.trim()) errors.push(`${prefix}: 'title' is required`);
-          if (!["ERROR", "WARNING", "INFO"].includes(rule.severity)) {
-            errors.push(`${prefix}: 'severity' must be ERROR, WARNING, or INFO`);
-          }
-          if (!rule.type) {
-            errors.push(`${prefix}: 'type' is required`);
-          } else {
-            if (["API_VERSION", "FORBIDDEN_PATTERN", "DOCUMENT_REQUIRED"].includes(rule.type) && !rule.pattern) {
-              errors.push(`${prefix}: 'pattern' regex is required for type ${rule.type}`);
-            }
-            if (rule.type === "API_VERSION" && !rule.minVersion) {
-              errors.push(`${prefix}: 'minVersion' is required for API_VERSION`);
-            }
-            if (rule.type === "FORBIDDEN_TOKENS" && (!rule.tokens || rule.tokens.length === 0)) {
-              errors.push(`${prefix}: 'tokens' array required for FORBIDDEN_TOKENS`);
-            }
-            if (rule.type === "REQUIRED_WHEN" && (!rule.triggerPattern || !rule.requiredPattern)) {
-              errors.push(`${prefix}: 'triggerPattern' and 'requiredPattern' are required for REQUIRED_WHEN`);
-            }
-          }
-        });
-      }
-
-      setSchemaValidationResult({
-        valid: errors.length === 0,
-        errors,
-      });
-      if (errors.length === 0) {
-        setSuccessBanner("Schema check passed! Document satisfies strict JSON rulebook schema.");
-        setTimeout(() => setSuccessBanner(null), 3000);
-      }
-    } catch (err) {
-      setSchemaValidationResult({
-        valid: false,
-        errors: [`Invalid JSON Syntax: ${err instanceof Error ? err.message : String(err)}`],
-      });
-    }
-  }
-
-  // Delete Scan from History
-  async function handleDeleteScan(id: string) {
-    try {
-      await deleteScan(id);
-      setHistory(await listScans());
-      if (scan?.id === id) {
-        setScan(null);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete scan record");
-    }
-  }
-
-  // Clear All Scans
-  async function handleClearAllScans() {
-    if (!confirm("Permanently delete all scan records from MongoDB?")) return;
-    try {
-      await clearAllScans();
-      setHistory([]);
-      setScan(null);
-      setSuccessBanner("Scan history cleared.");
-      setTimeout(() => setSuccessBanner(null), 3000);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to clear history");
-    }
-  }
-
-  // Export Audit Report (JSON / Markdown / SARIF 2.1.0)
-  async function exportReport(format: "json" | "markdown" | "sarif") {
-    if (!scan) return;
-    let contentStr = "";
-    let mimeType = "application/json";
-    let filename = `compliance-audit-${scan.sourceName || "document"}.${format === "sarif" ? "sarif" : format === "json" ? "json" : "md"}`;
-
-    if (format === "sarif") {
+    void runTask("Validating with the backend…", async () => {
       try {
-        const sarifData = await getSarifExport(scan.id);
-        contentStr = JSON.stringify(sarifData, null, 2);
-      } catch {
-        // Fallback to client-side SARIF 2.1.0 construction
-        const ruleDefs = Array.from(new Set(scan.findings.map(f => f.ruleId))).map(rid => {
-          const sample = scan.findings.find(f => f.ruleId === rid)!;
-          return {
-            id: rid,
-            name: sample.title || rid,
-            shortDescription: { text: sample.title || rid },
-            fullDescription: { text: sample.message },
-            help: { text: sample.suggestion || "" },
-            defaultConfiguration: {
-              level: sample.severity === "ERROR" ? "error" : sample.severity === "WARNING" ? "warning" : "note"
-            }
-          };
-        });
-        const sarifObj = {
-          $schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-          version: "2.1.0",
-          runs: [{
-            tool: {
-              driver: {
-                name: "Structured Document Compliance Auditor",
-                version: "1.0.0",
-                rules: ruleDefs
-              }
-            },
-            results: scan.findings.map(f => ({
-              ruleId: f.ruleId,
-              level: f.severity === "ERROR" ? "error" : f.severity === "WARNING" ? "warning" : "note",
-              message: { text: f.message },
-              locations: [{
-                physicalLocation: {
-                  artifactLocation: { uri: scan.sourceName },
-                  region: {
-                    startLine: f.lineNumber,
-                    startColumn: f.matchStart + 1,
-                    endColumn: Math.max(f.matchStart + 1, f.matchEnd + 1),
-                    snippet: { text: f.excerpt || f.lineText }
-                  }
-                }
-              }]
-            }))
-          }]
-        };
-        contentStr = JSON.stringify(sarifObj, null, 2);
+        const effective = await validateRulebook(readStudioRulebook());
+        setEffectiveRules(effective.rules || []);
+        setSchemaValidationResult({ valid: true, errors: [] });
+        notify("Backend validation passed, including Java regex and inheritance checks.");
+      } catch (err) {
+        setSchemaValidationResult({ valid: false, errors: [err instanceof Error ? err.message : String(err)] });
       }
-      mimeType = "application/json";
-    } else if (format === "json") {
-      contentStr = JSON.stringify(scan, null, 2);
-    } else {
-      contentStr = `# Structured Document Compliance Audit Report
-**Source:** ${scan.sourceName}
-**Rulebook:** ${scan.rulebookName}
-**Date:** ${new Date(scan.createdAt).toLocaleString()}
-**Status:** ${scan.compliant ? "COMPLIANT" : "NON-COMPLIANT"}
-**Summary:** ${scan.lineCount} Lines Audited | ${scan.errorCount} Errors | ${scan.warningCount} Warnings | ${scan.infoCount} Info
+    });
+  }
 
----
+  function toggleEffectiveRules() {
+    if (showEffectiveRules) { setShowEffectiveRules(false); return; }
+    void runTask("Loading inherited draft rules…", async () => {
+      const effective = await validateRulebook(readStudioRulebook());
+      setEffectiveRules(effective.rules || []);
+      setShowEffectiveRules(true);
+    });
+  }
 
-## Findings Breakdown (${scan.findings.length} total)
+  function handleDeleteScan(id: string) {
+    if (!confirm("Delete this scan record?")) return;
+    void runTask("Deleting scan…", async () => {
+      await deleteScan(id);
+      setHistory(items => items.filter(item => item.id !== id));
+      if (scan?.id === id) { setScan(null); setActiveLine(null); }
+      notify("Scan deleted.");
+    });
+  }
 
-${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f, i) => `### ${i + 1}. [${f.severity}] Line ${f.lineNumber}: ${f.title}
-- **Category:** ${f.category}
-- **Message:** ${f.message}
-- **Offending Code:** \`${f.excerpt || f.lineText}\`
-- **Remediation Suggestion:** ${f.suggestion || "N/A"}
-`).join("\n\n")}
-`;
-      mimeType = "text/markdown";
-    }
+  function handleClearAllScans() {
+    if (!confirm("Permanently delete all scan records?")) return;
+    void runTask("Clearing history…", async () => {
+      await clearAllScans(); setHistory([]); setScan(null); setActiveLine(null); notify("Scan history cleared.");
+    });
+  }
 
-    const blob = new Blob([contentStr], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    link.click();
-    URL.revokeObjectURL(url);
+  function viewScan(id: string) {
+    if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+        !confirm("Open this scan and discard unsaved rulebook changes?")) return;
+    void runTask("Loading scan…", async () => {
+      const record = await getScan(id);
+      const savedBook = rulebooks.find(book => book.id === record.rulebookId);
+      draftMode.current = false;
+      setSelectedRulebookId(savedBook?.id || "");
+      if (!savedBook) {
+        setRuleJson("");
+        notify("Scan loaded. Its draft or removed rulebook is unavailable; choose a saved rulebook to run a new audit.");
+      }
+      setScan(record); setContent(record.content); setSourceName(record.sourceName); setActivePresetId("");
+      setActiveLine(record.findings[0]?.lineNumber ?? null); resetResultFilters(); setTab("auditor");
+    });
+  }
+
+  function exportReport(format: "json" | "markdown" | "sarif") {
+    if (!scan) return;
+    const record = scan;
+    void runTask("Exporting report…", async () => {
+      const blob = await downloadScanReport(record.id, format);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `compliance-audit-${record.sourceName.replace(/[^a-zA-Z0-9._-]/g, "_")}.${format === "markdown" ? "md" : format}`;
+      document.body.appendChild(link); link.click(); link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      notify(`Exported ${format.toUpperCase()} report.`);
+    });
   }
 
   // Navigation between violations
@@ -532,7 +482,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
-        triggerScan();
+        if (!taskRunning.current && tab === "auditor") triggerScan();
       } else if (e.altKey && (e.key === "n" || e.key === "N")) {
         e.preventDefault();
         jumpToNextViolation();
@@ -543,16 +493,16 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [content, selectedRulebookId, sourceName, violatingLineNumbers, activeLine]);
+  }, [busy, tab, content, selectedRulebookId, sourceName, violatingLineNumbers, activeLine]);
 
   // Filtered Findings
   const filteredFindings = useMemo(() => {
     if (!scan) return [];
     return scan.findings.filter((f) => {
       if (severityFilter !== "ALL" && f.severity !== severityFilter) return false;
-      if (categoryFilter !== "ALL" && f.category.toLowerCase() !== categoryFilter.toLowerCase()) return false;
+      if (categoryFilter !== "ALL" && (f.category || "General").toLowerCase() !== categoryFilter.toLowerCase()) return false;
       if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
+        const q = searchQuery.trim().toLowerCase();
         const matches =
           f.title.toLowerCase().includes(q) ||
           f.message.toLowerCase().includes(q) ||
@@ -566,6 +516,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
 
   return (
     <div className="shell">
+      <a className="skip-link" href="#main-content">Skip to workspace</a>
       {/* Masthead */}
       <header className="masthead">
         <div className="brand">
@@ -583,12 +534,12 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
         </div>
         <div className="header-status">
           <span className="status-badge">
-            <span className="status-dot"></span>
-            MongoDB Connected
+            <span className={`status-dot ${databaseStatus}`}></span>
+            {databaseStatus === "connected" ? "Database connected" : databaseStatus === "checking" ? "Checking database…" : "Database unavailable"}
           </span>
           <span className="status-badge">
             <Code2 size={13} />
-            Java 21 Engine
+            {apiStatus === "connected" ? "API online" : apiStatus === "checking" ? "Checking API…" : "API unavailable"}
           </span>
           <span className="status-badge">
             <BookOpen size={13} />
@@ -598,10 +549,11 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
       </header>
 
       {/* Tabs Navigation */}
-      <nav className="nav-bar">
+      <nav className="nav-bar" aria-label="Main navigation">
         <div className="tabs">
           <button
             className={`tab-btn ${tab === "auditor" ? "active" : ""}`}
+            aria-current={tab === "auditor" ? "page" : undefined}
             onClick={() => setTab("auditor")}
           >
             <FileText size={16} />
@@ -609,6 +561,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
           </button>
           <button
             className={`tab-btn ${tab === "rulebook" ? "active" : ""}`}
+            aria-current={tab === "rulebook" ? "page" : undefined}
             onClick={() => setTab("rulebook")}
           >
             <BookOpen size={16} />
@@ -616,6 +569,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
           </button>
           <button
             className={`tab-btn ${tab === "history" ? "active" : ""}`}
+            aria-current={tab === "history" ? "page" : undefined}
             onClick={() => setTab("history")}
           >
             <History size={16} />
@@ -624,6 +578,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
           </button>
           <button
             className={`tab-btn ${tab === "cicd" ? "active" : ""}`}
+            aria-current={tab === "cicd" ? "page" : undefined}
             onClick={() => setTab("cicd")}
           >
             <Terminal size={16} />
@@ -651,7 +606,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
 
       {/* Alert Banners */}
       {error && (
-        <div className="banner error">
+        <div className="banner error" role="alert">
           <AlertCircle size={18} />
           <span style={{ flex: 1 }}>{error}</span>
           <button className="btn btn-sm btn-danger" onClick={() => setError(null)}>
@@ -661,12 +616,19 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
       )}
 
       {successBanner && (
-        <div className="banner success">
+        <div className="banner success" role="status">
           <CheckCircle2 size={18} />
           <span>{successBanner}</span>
         </div>
       )}
 
+      <div className="connection-toolbar">
+        <span role="status" aria-live="polite">{busy ? operationLabel : databaseStatus === "connected" ? "Catalog ready" : "Start the API and MongoDB, then refresh the connection."}</span>
+        <button className="btn btn-sm" disabled={busy} onClick={refreshConnection}><RotateCcw size={14} />Refresh connection</button>
+      </div>
+      <main id="main-content" aria-busy={busy}>
+      <fieldset className="workspace-controls" disabled={busy}>
+      <legend className="sr-only">Workspace controls</legend>
       {/* TAB 1: AUDITOR WORKSPACE */}
       {tab === "auditor" && (
         <div className="workspace-grid">
@@ -706,7 +668,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     setContent("");
                     setSourceName("custom-record.txt");
                     setActivePresetId("");
-                    setScan(null);
+                    setScan(null); setActiveLine(null); resetResultFilters();
                   }}
                 >
                   <Trash2 size={13} />
@@ -721,9 +683,19 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
+              tabIndex={busy ? -1 : 0}
+              role="button"
+              aria-label="Upload and audit a text document"
+              aria-disabled={busy}
+              onKeyDown={event => {
+                if (!busy && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault(); event.currentTarget.querySelector("input")?.click();
+                }
+              }}
             >
               <input
                 type="file"
+                aria-label="Upload text document"
                 accept=".log,.txt,.json,.yaml,.yml,.md,.csv,.conf"
                 onChange={handleFileInput}
               />
@@ -733,7 +705,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                   Drag & drop text record or log file here, or click to browse
                 </span>
                 <span className="dropzone-sub">
-                  Supports .log, .txt, .md (framework docs), .json, .yaml, and .csv
+                  UTF-8 text · .log, .txt, .md, .json, .yaml, .yml, .csv, .conf · up to 8 MB · scans immediately
                 </span>
               </div>
             </label>
@@ -741,11 +713,14 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
             {/* Rulebook Selection & Source Name */}
             <div className="input-row">
               <div className="form-group">
-                <label>Compliance Rulebook (MongoDB)</label>
+                <label htmlFor="auditor-rulebook">Compliance Rulebook</label>
                 <select
+                  id="auditor-rulebook"
+                  aria-label="Compliance rulebook"
                   value={selectedRulebookId}
-                  onChange={(e) => setSelectedRulebookId(e.target.value)}
+                  onChange={(e) => selectRulebook(e.target.value)}
                 >
+                  {!selectedRulebookId && <option value="">{rulebooks.length ? "Select a saved rulebook" : "No rulebooks available"}</option>}
                   {rulebooks.map((b) => (
                     <option key={b.id} value={b.id}>
                       {b.name} (v{b.version}) - {b.rules?.length || 0} rules
@@ -754,11 +729,12 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </select>
               </div>
               <div className="form-group">
-                <label>Source Record Identifier</label>
+                <label htmlFor="source-name">Source Record Identifier</label>
                 <input
+                  id="source-name"
                   type="text"
                   value={sourceName}
-                  onChange={(e) => setSourceName(e.target.value)}
+                  onChange={(e) => { setSourceName(e.target.value); setActivePresetId(""); }}
                   placeholder="e.g. system.log, react-docs.md"
                 />
               </div>
@@ -772,8 +748,9 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </div>
               <textarea
                 className="editor-textarea"
+                aria-label="Document content"
                 value={content}
-                onChange={(e) => setContent(e.target.value)}
+                onChange={(e) => { setContent(e.target.value); setActivePresetId(""); }}
                 spellCheck={false}
                 placeholder="Paste system logs or open source framework documentation records here..."
               />
@@ -784,11 +761,11 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               <div className="btn-group">
                 <button
                   className="btn btn-primary"
-                  disabled={busy}
+                  disabled={busy || !content.trim() || !selectedRulebookId}
                   onClick={triggerScan}
                 >
                   {busy ? (
-                    <>Scanning Document…</>
+                    <>{operationLabel}</>
                   ) : (
                     <>
                       <ShieldCheck size={16} />
@@ -798,7 +775,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </button>
                 <button
                   className="btn"
-                  disabled={busy}
+                  disabled={busy || !content.trim() || !ruleJson}
                   onClick={triggerStudioTestScan}
                   title="Audits against in-progress Studio JSON rulebook without saving to database"
                 >
@@ -808,11 +785,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </div>
               <button
                 className="btn btn-sm"
-                onClick={() => {
-                  void navigator.clipboard.writeText(content);
-                  setSuccessBanner("Source content copied to clipboard!");
-                  setTimeout(() => setSuccessBanner(null), 2500);
-                }}
+                onClick={() => void copyText(content, "Source content copied.")}
               >
                 <Copy size={14} />
                 Copy
@@ -830,17 +803,20 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                   Select a rulebook and click <strong>Audit Document</strong> to scan for outdated
                   API versions, missing validation flags, and deprecated tags.
                 </p>
-                <button className="btn btn-primary" onClick={triggerScan}>
+                <button className="btn btn-primary" disabled={busy || !content.trim() || !selectedRulebookId} onClick={triggerScan}>
                   Run Compliance Scan
                 </button>
               </div>
             ) : (
               <div>
+                <p className="hint">Report for <strong>{scan.sourceName}</strong> · {scan.rulebookName} · {new Date(scan.createdAt).toLocaleString()}</p>
+                {(scan.content !== content || scan.sourceName !== sourceName || (selectedRulebookId && scan.rulebookId !== selectedRulebookId)) &&
+                  <div className="banner" role="status">This report is from an earlier document or rulebook. Run a new audit to update the results.</div>}
                 {/* Scorecard */}
                 <div className={`scorecard ${scan.compliant ? "compliant" : "violations"}`}>
                   <div className={`status-badge-lg ${scan.compliant ? "pass" : "fail"}`}>
                     {scan.compliant ? <ShieldCheck size={20} /> : <ShieldAlert size={20} />}
-                    {scan.compliant ? "QUALITY GATE PASSED" : "VIOLATIONS DETECTED"}
+                    {scan.compliant ? "NO ERRORS" : "ERRORS DETECTED"}
                   </div>
                   <div className="score-stats">
                     <div className="stat-item">
@@ -880,8 +856,8 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                           ? `${Math.max(
                               0,
                               Math.round(((scan.lineCount - violatingLineNumbers.length) / scan.lineCount) * 100)
-                            )}% Quality Score`
-                          : "100% Quality Score"}
+                            )}% Lines Without Findings`
+                          : "100% Lines Without Findings"}
                       </span>
                     </div>
                   </div>
@@ -896,6 +872,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                         <button
                           className="btn btn-sm"
                           onClick={jumpToPrevViolation}
+                          aria-label="Previous violation"
                           title="Previous violation (Alt+P)"
                         >
                           <ChevronLeft size={14} />
@@ -903,6 +880,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                         <button
                           className="btn btn-sm"
                           onClick={jumpToNextViolation}
+                          aria-label="Next violation"
                           title="Next violation (Alt+N)"
                         >
                           <ChevronRight size={14} />
@@ -962,7 +940,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     >
                       All Categories
                     </button>
-                    {Array.from(new Set(scan.findings.map((f) => f.category))).map((cat) => (
+                    {Array.from(new Set(scan.findings.map((f) => f.category || "General"))).map((cat) => (
                       <button
                         key={cat}
                         className={`filter-pill ${categoryFilter.toLowerCase() === cat.toLowerCase() ? "active" : ""}`}
@@ -981,6 +959,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     style={{ position: "absolute", left: "12px", top: "10px", color: "var(--muted)" }}
                   />
                   <input
+                    aria-label="Search findings"
                     type="search"
                     style={{ paddingLeft: "34px" }}
                     placeholder="Search findings (title, message, code excerpt, remediation)..."
@@ -1017,7 +996,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     Audit Findings ({filteredFindings.length})
                   </h2>
                   <span className="status-badge">
-                    {selectedRulebook?.name || scan.rulebookName}
+                    {scan.rulebookName}
                   </span>
                 </div>
 
@@ -1041,13 +1020,20 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                           activeLine === finding.lineNumber ? "active" : ""
                         }`}
                         onClick={() => setActiveLine(finding.lineNumber)}
+                        tabIndex={0}
+                        role="button"
+                        onKeyDown={event => {
+                          if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+                            event.preventDefault(); setActiveLine(finding.lineNumber);
+                          }
+                        }}
                       >
                         <div className="finding-header">
                           <div className="finding-badges">
                             <span className={`badge-sev ${finding.severity.toLowerCase()}`}>
                               {finding.severity}
                             </span>
-                            <span className="badge-cat">{finding.category}</span>
+                            <span className="badge-cat">{finding.category || "General"}</span>
                             <span className="badge-cat">Rule: {finding.ruleId}</span>
                           </div>
                           <button
@@ -1064,19 +1050,18 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                         <h4 className="finding-title">{finding.title}</h4>
                         <p className="finding-message">{finding.message}</p>
                         {finding.excerpt && (
-                          <div style={{ position: "relative" }}>
+                          <div className="excerpt-row">
                             <div className="finding-excerpt">
                               &gt; {finding.excerpt}
                             </div>
                             <button
                               className="btn btn-sm"
-                              style={{ position: "absolute", right: "6px", top: "5px", padding: "2px 6px", fontSize: "10px" }}
+                              style={{ padding: "6px 9px" }}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                void navigator.clipboard.writeText(finding.excerpt);
-                                setSuccessBanner("Offending snippet copied!");
-                                setTimeout(() => setSuccessBanner(null), 2000);
+                                void copyText(finding.excerpt, "Snippet copied.");
                               }}
+                              aria-label="Copy offending code excerpt"
                               title="Copy offending code excerpt"
                             >
                               <Copy size={11} />
@@ -1119,7 +1104,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 onClick={() => setStudioView("visual")}
               >
                 <BookOpen size={14} />
-                Rule Cards ({selectedRulebook?.rules?.length || 0})
+                Rule Cards ({studioRulebook?.rules?.length || 0})
               </button>
               <button
                 className={`btn btn-sm ${studioView === "schema" ? "btn-primary" : ""}`}
@@ -1131,16 +1116,17 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
             </div>
 
             <div className="btn-group studio-actions">
+              <button className="btn btn-sm" onClick={newRulebook}>New Rulebook</button>
               <button className="btn btn-sm" onClick={formatRuleJson}>
                 Format
               </button>
               <button className="btn btn-sm" onClick={validateJsonAgainstSchema}>
                 Validate
               </button>
-              <button className="btn btn-sm btn-primary" disabled={busy} onClick={handleSaveRulebook}>
+              <button className="btn btn-sm btn-primary" disabled={busy || !ruleJson} onClick={handleSaveRulebook}>
                 Save Rulebook
               </button>
-              <button className="btn btn-sm btn-danger" disabled={busy} onClick={handleDeleteRulebook}>
+              <button className="btn btn-sm btn-danger" disabled={busy || !selectedRulebookId} onClick={handleDeleteRulebook}>
                 <Trash2 size={13} />
                 Delete
               </button>
@@ -1185,10 +1171,12 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     Active Rulebook Specification
                   </h2>
                   <select
+                    aria-label="Studio rulebook"
                     value={selectedRulebookId}
-                    onChange={(e) => setSelectedRulebookId(e.target.value)}
+                    onChange={(e) => selectRulebook(e.target.value)}
                   >
-                    {rulebooks.map((b) => (
+                    {!selectedRulebookId && <option value="">{rulebooks.length ? "Select a saved rulebook" : "No rulebooks available"}</option>}
+                  {rulebooks.map((b) => (
                       <option key={b.id} value={b.id}>
                         {b.name} (v{b.version})
                       </option>
@@ -1196,11 +1184,12 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                   </select>
                 </div>
 
-                <div style={{ display: "flex", alignItems: "center", gap: "10px", margin: "10px 0 14px", padding: "8px 12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)" }}>
+                <div className="inheritance-control">
                   <Layers size={16} style={{ color: "var(--accent)", flexShrink: 0 }} />
-                  <span style={{ fontSize: "12px", color: "var(--muted)", whiteSpace: "nowrap" }}>Inherits Rules From (Extends):</span>
+                  <span style={{ fontSize: "12px", color: "var(--muted)", whiteSpace: "normal" }}>Inherits Rules From (Extends):</span>
                   <select
                     style={{ fontSize: "12px", padding: "4px 8px", flex: 1 }}
+                    aria-label="Parent rulebook"
                     value={(() => {
                       try {
                         const parsed = JSON.parse(ruleJson);
@@ -1222,6 +1211,9 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                           delete parsed.extendsRulebookName;
                         }
                         setRuleJson(JSON.stringify(parsed, null, 2));
+                        setSchemaValidationResult(null);
+                        setEffectiveRules([]);
+                        setShowEffectiveRules(false);
                       } catch {
                         setError("Invalid JSON, please fix syntax before updating inheritance");
                       }
@@ -1246,11 +1238,14 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </p>
                 <textarea
                   className="editor-textarea"
+                  aria-label="Rulebook JSON"
                   style={{ minHeight: "480px" }}
                   value={ruleJson}
                   onChange={(e) => {
                     setRuleJson(e.target.value);
                     setSchemaValidationResult(null);
+                    setEffectiveRules([]);
+                    setShowEffectiveRules(false);
                   }}
                   spellCheck={false}
                 />
@@ -1264,18 +1259,18 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     Rulebook Summary
                   </h2>
                   <span className="status-badge">
-                    {selectedRulebook?.version ? `v${selectedRulebook.version}` : "Draft"}
+                    {studioRulebook?.version ? `v${studioRulebook.version}` : "Draft"}
                   </span>
                 </div>
                 <h3 style={{ margin: "0 0 6px", color: "var(--accent)" }}>
-                  {selectedRulebook?.name || "Custom Rulebook"}
+                  {studioRulebook?.name || "Custom Rulebook"}
                 </h3>
                 <p style={{ color: "var(--muted)", margin: "0 0 16px" }}>
-                  {selectedRulebook?.description || "No description provided."}
+                  {studioRulebook?.description || "No description provided."}
                 </p>
 
                 <div className="rule-cards-list">
-                  {(selectedRulebook?.rules || []).map((rule) => (
+                  {(studioRulebook?.rules || []).map((rule) => (
                     <div key={rule.id} className="rule-card">
                       <div className="rule-card-header">
                         <strong>{rule.title}</strong>
@@ -1307,9 +1302,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
 
           {/* Sub-view: Visual Rule Cards */}
           {studioView === "visual" && (() => {
-            const rulesToDisplay = showEffectiveRules && effectiveRules.length > 0
-              ? effectiveRules
-              : (selectedRulebook?.rules || []);
+            const rulesToDisplay = showEffectiveRules ? effectiveRules : (studioRulebook?.rules || []);
             return (
             <div className="panel">
               <div className="panel-title">
@@ -1318,29 +1311,29 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                   Configured Compliance Rules ({rulesToDisplay.length})
                 </h2>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-                  {selectedRulebook?.extendsRulebookId && (
+                  {studioRulebook?.extendsRulebookId && (
                     <span className="status-badge" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
                       <Layers size={13} />
-                      Extends: {selectedRulebook.extendsRulebookName || selectedRulebook.extendsRulebookId}
+                      Extends: {studioRulebook.extendsRulebookName || studioRulebook.extendsRulebookId}
                     </span>
                   )}
-                  {selectedRulebook?.extendsRulebookId && (
+                  {studioRulebook?.extendsRulebookId && (
                     <button
                       className={`btn btn-sm ${showEffectiveRules ? "btn-primary" : ""}`}
-                      onClick={() => setShowEffectiveRules(!showEffectiveRules)}
+                      onClick={toggleEffectiveRules}
                       title="Toggle viewing only this rulebook's authored rules vs merged inherited rules"
                     >
                       <Layers size={13} />
                       {showEffectiveRules ? "Showing All (With Inherited)" : "Include Inherited Rules"}
                     </button>
                   )}
-                  <span className="status-badge">{selectedRulebook?.name}</span>
+                  <span className="status-badge">{studioRulebook?.name}</span>
                 </div>
               </div>
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fill, minmax(360px, 1fr))",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 320px), 1fr))",
                   gap: "16px",
                 }}
               >
@@ -1349,6 +1342,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                     <div className="rule-card-header">
                       <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
                         <span className="badge-cat">{rule.category}</span>
+                        {rule.enabled === false && <span className="badge-cat">Disabled</span>}
                         {rule.inherited && (
                           <span className="badge-cat" style={{ background: "rgba(45, 212, 191, 0.15)", color: "var(--accent)" }}>
                             Inherited ({rule.inheritedFrom || "Parent"})
@@ -1419,11 +1413,10 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </h2>
                 <button
                   className="btn btn-sm"
+                  disabled={!schemaDoc}
                   onClick={() => {
                     if (schemaDoc) {
-                      void navigator.clipboard.writeText(JSON.stringify(schemaDoc, null, 2));
-                      setSuccessBanner("Schema definition copied to clipboard!");
-                      setTimeout(() => setSuccessBanner(null), 2500);
+                      void copyText(JSON.stringify(schemaDoc, null, 2), "Schema copied.");
                     }
                   }}
                 >
@@ -1439,7 +1432,8 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               <textarea
                 className="editor-textarea"
                 style={{ minHeight: "440px" }}
-                value={schemaDoc ? JSON.stringify(schemaDoc, null, 2) : "Loading schema..."}
+                aria-label="Backend rulebook schema"
+                value={schemaDoc ? JSON.stringify(schemaDoc, null, 2) : "Schema unavailable. Use Refresh connection to retry."}
                 readOnly
               />
             </div>
@@ -1458,7 +1452,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
             <div className="btn-group">
               <button
                 className="btn btn-sm btn-danger"
-                disabled={history.length === 0}
+                disabled={busy || history.length === 0}
                 onClick={handleClearAllScans}
               >
                 <Trash2 size={14} />
@@ -1470,7 +1464,7 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
           {history.length === 0 ? (
             <div style={{ textAlign: "center", padding: "48px 20px", color: "var(--muted)" }}>
               <History size={36} style={{ margin: "0 auto 12px" }} />
-              <p>No audit scans recorded in MongoDB yet. Run a scan from the Auditor Workspace!</p>
+              <p>{historyLoaded ? "No scans recorded yet. Run an audit from the workspace." : "Scan history is unavailable. Refresh the connection to retry."}</p>
             </div>
           ) : (
             <div className="history-table-container">
@@ -1514,23 +1508,15 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                         <div className="btn-group" style={{ justifyContent: "flex-end" }}>
                           <button
                             className="btn btn-sm btn-primary"
-                            onClick={() => {
-                              void getScan(item.id).then((record) => {
-                                setScan(record);
-                                setContent(record.content);
-                                setSourceName(record.sourceName);
-                                setSelectedRulebookId(record.rulebookId);
-                                setActiveLine(record.findings[0]?.lineNumber ?? null);
-                                setTab("auditor");
-                              });
-                            }}
+                            onClick={() => viewScan(item.id)}
                           >
                             View & Highlight
                           </button>
                           <button
                             className="btn btn-sm btn-danger"
                             onClick={() => handleDeleteScan(item.id)}
-                            title="Delete scan record from MongoDB"
+                            aria-label={`Delete scan ${item.sourceName}`}
+                            title="Delete scan record"
                           >
                             <Trash2 size={13} />
                           </button>
@@ -1595,15 +1581,16 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
 
             <div className="cicd-grid" style={{ gap: "14px", margin: "16px 0" }}>
               <div>
-                <label style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
+                <label htmlFor="ciTargetFile" style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
                   Target Document / Spec:
                 </label>
                 <select
                   style={{ width: "100%", padding: "8px" }}
+                  id="ciTargetFile"
                   value={ciTargetFile}
                   onChange={(e) => setCiTargetFile(e.target.value)}
                 >
-                  <option value="samples/openapi-spec.yaml">samples/openapi-spec.yaml (OpenAPI 3.x)</option>
+                  <option value="samples/openapi-spec.yaml">samples/openapi-spec.yaml (Swagger 2.0 test record)</option>
                   <option value="samples/framework-documentation.md">samples/framework-documentation.md (Markdown)</option>
                   <option value="samples/system.log">samples/system.log (Platform Log)</option>
                 </select>
@@ -1615,9 +1602,11 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </label>
                 <select
                   style={{ width: "100%", padding: "8px" }}
-                  value={selectedRulebookId}
-                  onChange={(e) => setSelectedRulebookId(e.target.value)}
+                  aria-label="Compliance rulebook"
+                  value={ciRulebookId}
+                  onChange={(e) => setCiRulebookId(e.target.value)}
                 >
+                  <option value="">Choose a rulebook</option>
                   {rulebooks.map((b) => (
                     <option key={b.id} value={b.id}>
                       {b.name} (v{b.version})
@@ -1627,13 +1616,14 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </div>
 
               <div>
-                <label style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
+                <label htmlFor="ciFormat" style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
                   Output Format:
                 </label>
                 <select
                   style={{ width: "100%", padding: "8px" }}
+                  id="ciFormat"
                   value={ciFormat}
-                  onChange={(e) => setCiFormat(e.target.value as any)}
+                  onChange={(e) => setCiFormat(e.target.value as typeof ciFormat)}
                 >
                   <option value="sarif">SARIF 2.1.0 (GitHub Code Scanning)</option>
                   <option value="terminal">Terminal ANSI (Human-Readable)</option>
@@ -1643,13 +1633,14 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </div>
 
               <div>
-                <label style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
+                <label htmlFor="ciFailOn" style={{ display: "block", fontSize: "12px", color: "var(--muted)", marginBottom: "4px" }}>
                   CI Failure Threshold:
                 </label>
                 <select
                   style={{ width: "100%", padding: "8px" }}
+                  id="ciFailOn"
                   value={ciFailOn}
-                  onChange={(e) => setCiFailOn(e.target.value as any)}
+                  onChange={(e) => setCiFailOn(e.target.value as typeof ciFailOn)}
                 >
                   <option value="error">Fail on ERROR only (exit code 1)</option>
                   <option value="warning">Fail on ERROR or WARNING (strict gate)</option>
@@ -1657,6 +1648,11 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </div>
             </div>
 
+            <div className="form-group">
+              <label htmlFor="ci-server">Backend URL for cURL</label>
+              <input id="ci-server" type="url" value={ciServer} onChange={event => setCiServer(event.target.value)} placeholder="http://localhost:8080" />
+            </div>
+            <p className="hint">The workflow starts MongoDB and the API, uses the selected document and threshold, and exports SARIF. Custom rulebooks must also exist in the CI database.</p>
             {/* Generated CLI Command Box */}
             <div style={{ marginTop: "16px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
@@ -1665,19 +1661,15 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </strong>
                 <button
                   className="btn btn-sm"
-                  onClick={() => {
-                    const cmd = `./cli/audit.sh ${ciTargetFile} --rulebook "${selectedRulebook?.name || selectedRulebookId}" --format ${ciFormat} --fail-on ${ciFailOn}`;
-                    void navigator.clipboard.writeText(cmd);
-                    setCopiedCiSnippet("cli");
-                    setTimeout(() => setCopiedCiSnippet(null), 2500);
-                  }}
+                  disabled={!ciRulebookId}
+                  onClick={() => void copyText(generatedCli, "CLI command copied.", "cli")}
                 >
                   {copiedCiSnippet === "cli" ? <Check size={13} style={{ color: "var(--pass)" }} /> : <Copy size={13} />}
                   {copiedCiSnippet === "cli" ? "Copied!" : "Copy Command"}
                 </button>
               </div>
               <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "13px", color: "#86efac" }}>
-                <code>{`./cli/audit.sh ${ciTargetFile} --rulebook "${selectedRulebook?.name || selectedRulebookId}" --format ${ciFormat} --fail-on ${ciFailOn}`}</code>
+                <code>{generatedCli}</code>
               </pre>
             </div>
 
@@ -1689,19 +1681,15 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
                 </strong>
                 <button
                   className="btn btn-sm"
-                  onClick={() => {
-                    const curlCmd = `curl -s -F "file=@${ciTargetFile}" "http://localhost:8080/api/scans/upload?rulebookId=${selectedRulebookId}" | jq .`;
-                    void navigator.clipboard.writeText(curlCmd);
-                    setCopiedCiSnippet("curl");
-                    setTimeout(() => setCopiedCiSnippet(null), 2500);
-                  }}
+                  disabled={!ciRulebookId || !/^https?:\/\//.test(ciServer)}
+                  onClick={() => void copyText(generatedCurl, "cURL command copied.", "curl")}
                 >
                   {copiedCiSnippet === "curl" ? <Check size={13} style={{ color: "var(--pass)" }} /> : <Copy size={13} />}
                   {copiedCiSnippet === "curl" ? "Copied!" : "Copy cURL"}
                 </button>
               </div>
               <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "12.5px", color: "#93c5fd" }}>
-                <code>{`curl -s -F "file=@${ciTargetFile}" "http://localhost:8080/api/scans/upload?rulebookId=${selectedRulebookId}" | jq .`}</code>
+                <code>{generatedCurl}</code>
               </pre>
             </div>
           </div>
@@ -1715,45 +1703,8 @@ ${scan.findings.length === 0 ? "No violations detected." : scan.findings.map((f,
               </h2>
               <button
                 className="btn btn-sm btn-primary"
-                onClick={() => {
-                  const yml = `name: Document Compliance Audit
-
-on:
-  pull_request:
-    branches: [ main, master ]
-  push:
-    branches: [ main, master ]
-
-jobs:
-  audit:
-    name: Audit OpenAPI Specs & Documentation
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Run Document Compliance Auditor
-        run: |
-          chmod +x cli/audit.sh
-          ./cli/audit.sh samples/openapi-spec.yaml --fail-on error --format sarif -o results.sarif
-
-      - name: Upload SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: compliance-auditor`;
-                  void navigator.clipboard.writeText(yml);
-                  setCopiedCiSnippet("gha");
-                  setTimeout(() => setCopiedCiSnippet(null), 2500);
-                }}
+                disabled={!ciRulebookId}
+                onClick={() => void copyText(generatedWorkflow, "Workflow YAML copied.", "gha")}
               >
                 {copiedCiSnippet === "gha" ? <Check size={13} /> : <Copy size={13} />}
                 {copiedCiSnippet === "gha" ? "Copied Workflow YAML!" : "Copy Workflow YAML"}
@@ -1764,39 +1715,13 @@ jobs:
             </p>
 
             <pre style={{ margin: 0, padding: "14px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "12.5px", color: "var(--ink)" }}>
-{`name: Document Compliance Audit
-
-on:
-  pull_request:
-    branches: [ main, master ]
-  push:
-    branches: [ main, master ]
-
-jobs:
-  audit:
-    name: Audit OpenAPI Specs & Documentation
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Run Compliance Auditor CLI
-        run: |
-          chmod +x cli/audit.sh
-          # Audits specs and exports standard SARIF 2.1.0
-          ./cli/audit.sh samples/openapi-spec.yaml --fail-on error --format sarif -o results.sarif
-
-      - name: Upload SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: compliance-auditor`}
+{generatedWorkflow}
             </pre>
           </div>
         </div>
       )}
+      </fieldset>
+      </main>
     </div>
   );
 }
@@ -1825,7 +1750,7 @@ function HighlightedDocument({
     return map;
   }, [findings]);
 
-  const rawLines = useMemo(() => content.split(/\r?\n/), [content]);
+  const rawLines = useMemo(() => content.split(/\r\n|[\n\r\u0085\u2028\u2029]/), [content]);
 
   return (
     <table className="code-table">
@@ -1853,6 +1778,13 @@ function HighlightedDocument({
               data-line={lineNumber}
               className={rowClass}
               onClick={() => onSelectLine(lineNumber)}
+              tabIndex={0}
+              aria-label={`Line ${lineNumber}${hits.length ? `, ${hits.length} findings` : ""}`}
+              onKeyDown={event => {
+                if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault(); onSelectLine(lineNumber);
+                }
+              }}
             >
               <td className="code-gutter">
                 {hits.length > 0 && <span style={{ marginRight: "4px" }}>●</span>}
