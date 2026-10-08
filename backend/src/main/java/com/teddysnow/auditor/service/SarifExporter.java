@@ -5,12 +5,14 @@ import com.teddysnow.auditor.model.ScanRecord;
 import com.teddysnow.auditor.model.Severity;
 import org.springframework.stereotype.Component;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.*;
 
 @Component
 public class SarifExporter {
 
-    public static final String SARIF_SCHEMA = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json";
+    public static final String SARIF_SCHEMA = "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json";
     public static final String SARIF_VERSION = "2.1.0";
 
     public Map<String, Object> export(ScanRecord scan) {
@@ -33,7 +35,7 @@ public class SarifExporter {
         Map<String, Object> driver = new LinkedHashMap<>();
         driver.put("name", "Structured Document Compliance Auditor");
         driver.put("version", "1.0.0");
-        driver.put("informationUri", "https://github.com/teddysnow/compliance-auditor");
+        driver.put("informationUri", "https://github.com/teddynak/teddysnow");
 
         // Rules dictionary extracted from findings
         Map<String, Map<String, Object>> ruleDefinitions = new LinkedHashMap<>();
@@ -50,8 +52,8 @@ public class SarifExporter {
                     Map<String, Object> ruleDef = new LinkedHashMap<>();
                     ruleDef.put("id", finding.getRuleId());
                     ruleDef.put("name", finding.getTitle() != null ? finding.getTitle() : finding.getRuleId());
-                    ruleDef.put("shortDescription", Map.of("text", finding.getTitle() != null ? finding.getTitle() : ""));
-                    ruleDef.put("fullDescription", Map.of("text", finding.getMessage() != null ? finding.getMessage() : ""));
+                    ruleDef.put("shortDescription", Map.of("text", finding.getTitle() != null && !finding.getTitle().isBlank() ? finding.getTitle() : finding.getRuleId()));
+                    ruleDef.put("fullDescription", Map.of("text", finding.getMessage() != null && !finding.getMessage().isBlank() ? finding.getMessage() : "Rule violation"));
                     if (finding.getSuggestion() != null && !finding.getSuggestion().isBlank()) {
                         ruleDef.put("help", Map.of("text", finding.getSuggestion()));
                     }
@@ -70,28 +72,27 @@ public class SarifExporter {
 
                 // Location with exact line and column offsets
                 int line = Math.max(1, finding.getLineNumber());
-                int startCol = Math.max(1, finding.getMatchStart() + 1);
-                int endCol = Math.max(startCol, finding.getMatchEnd() + 1);
+                int startCol = Math.max(1, finding.getMatchStart() != null ? finding.getMatchStart() + 1 : 1);
 
                 Map<String, Object> region = new LinkedHashMap<>();
                 region.put("startLine", line);
-                region.put("startColumn", startCol);
-                region.put("endColumn", endCol);
+                if (finding.getMatchStart() != null) region.put("startColumn", startCol);
+                if (finding.getMatchEnd() != null && finding.getMatchEnd() + 1 > startCol) {
+                    region.put("endColumn", finding.getMatchEnd() + 1);
+                }
                 if (finding.getExcerpt() != null && !finding.getExcerpt().isBlank()) {
                     region.put("snippet", Map.of("text", finding.getExcerpt()));
                 }
 
                 Map<String, Object> physicalLocation = new LinkedHashMap<>();
-                physicalLocation.put("artifactLocation", Map.of("uri", targetUri));
+                physicalLocation.put("artifactLocation", Map.of("uri", artifactUri(targetUri)));
                 physicalLocation.put("region", region);
 
                 result.put("locations", List.of(Map.of("physicalLocation", physicalLocation)));
 
-                // Remediation fix suggestion if available
+                // Suggestions describe remediation; they are not executable SARIF artifact edits.
                 if (finding.getSuggestion() != null && !finding.getSuggestion().isBlank()) {
-                    result.put("fixes", List.of(Map.of(
-                            "description", Map.of("text", finding.getSuggestion())
-                    )));
+                    result.put("properties", Map.of("remediation", finding.getSuggestion()));
                 }
 
                 results.add(result);
@@ -104,12 +105,20 @@ public class SarifExporter {
 
         // Automation details & scan metadata
         run.put("automationDetails", Map.of(
-                "id", scan.getId() != null ? scan.getId() : UUID.randomUUID().toString(),
+                "id", "compliance/" + artifactUri(scan.getRulebookName() != null ? scan.getRulebookName() : "Default") + "/" + artifactUri(targetUri) + "/",
                 "description", Map.of("text", "Rulebook: " + (scan.getRulebookName() != null ? scan.getRulebookName() : "Default"))
         ));
 
         run.put("results", results);
         return run;
+    }
+
+    private String artifactUri(String path) {
+        try {
+            return new URI(null, null, path.replace('\\', '/'), null, null).toASCIIString();
+        } catch (URISyntaxException error) {
+            throw new IllegalArgumentException("Invalid document path", error);
+        }
     }
 
     private String toSarifLevel(Severity severity) {

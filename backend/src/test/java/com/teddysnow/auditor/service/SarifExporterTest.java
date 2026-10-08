@@ -68,5 +68,30 @@ class SarifExporterTest {
         assertEquals(5, region.get("startLine"));
         assertEquals(1, region.get("startColumn"));
         assertEquals(12, region.get("endColumn"));
+        assertFalse(result.containsKey("fixes"), "Prose suggestions must not become incomplete SARIF edits");
+        assertEquals("Upgrade to OpenAPI 3.1.0", ((Map<?, ?>) result.get("properties")).get("remediation"));
+        assertEquals("Upgrade to OpenAPI 3.1.0", ((Map<?, ?>) ((Map<?, ?>) ((List<?>) driver.get("rules")).get(0)).get("help")).get("text"));
+    }
+    @Test
+    @SuppressWarnings("unchecked")
+    void pathsAreValidUrisAndAutomationCategoryIsStableAcrossScans() {
+        ScanRecord scan = new ScanRecord();
+        scan.setId("first-scan");
+        scan.setSourceName("samples/My guide #1.md");
+        scan.setRulebookName("Documentation policy");
+        Finding finding = new Finding();
+        finding.setRuleId("check");
+        finding.setMessage("Review this line");
+        finding.setSeverity(Severity.WARNING);
+        finding.setLineNumber(1);
+        scan.setFindings(List.of(finding));
+        Map<?, ?> first = ((List<Map<?, ?>>) exporter.export(scan).get("runs")).get(0);
+        Map<?, ?> result = ((List<Map<?, ?>>) first.get("results")).get(0);
+        Map<?, ?> location = ((List<Map<?, ?>>) result.get("locations")).get(0);
+        Map<?, ?> physical = (Map<?, ?>) location.get("physicalLocation");
+        assertEquals("samples/My%20guide%20%231.md", ((Map<?, ?>) physical.get("artifactLocation")).get("uri"));
+        scan.setId("second-scan");
+        Map<?, ?> second = ((List<Map<?, ?>>) exporter.export(scan).get("runs")).get(0);
+        assertEquals(first.get("automationDetails"), second.get("automationDetails"));
     }
 }

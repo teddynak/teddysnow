@@ -2,59 +2,127 @@ name: Document Compliance Audit
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
 
 jobs:
   compliance-audit:
     name: Audit OpenAPI Specs, Logs & Documentation
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
+    env:
+      MONGODB_URI: mongodb://localhost:27017/compliance_auditor_ci
+      PORT: '8080'
+      COMPLIANCE_SERVER: http://localhost:8080
     services:
       mongodb:
         image: mongo:7
         ports:
           - 27017:27017
-
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping: 1}).ok ? 0 : 1)'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v6
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '21'
-          distribution: 'temurin'
+          distribution: temurin
           cache: maven
-
-      - name: Build & Start Compliance Auditor Engine
-        run: |
-          cd backend
-          ./mvnw spring-boot:start
-          # Wait for health check
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/api/health; do sleep 2; done'
-          cd ..
-
-      - name: Audit OpenAPI Spec & Export SARIF
-        run: |
-          chmod +x cli/audit.sh
-          ./cli/audit.sh samples/openapi-spec.yaml --format sarif -o openapi-results.sarif --fail-on error || true
-
-      - name: Audit Technical Documentation & Export SARIF
-        run: |
-          ./cli/audit.sh samples/framework-documentation.md --format sarif -o docs-results.sarif --fail-on error || true
-
+          cache-dependency-path: backend/pom.xml
+      - name: Install report validator
+        run: python3 -m pip install -r scripts/requirements-ci.txt
+      - name: Test CLI failure handling
+        run: python3 -m unittest discover -s cli/tests -v
+      - name: Build & Test Compliance Auditor Engine
+        working-directory: backend
+        run: ./mvnw -B -ntp clean verify
+      - name: Start Compliance Auditor Engine
+        run: ./scripts/start-auditor.sh
+      - name: Audit OpenAPI, Documentation & Logs and Validate SARIF
+        id: reports
+        # Samples deliberately contain policy violations. Generation errors still fail.
+        run: ./scripts/audit-examples.sh
+      - name: Preserve reports and startup logs
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: compliance-audit-reports
+          path: reports/
+          if-no-files-found: ignore
       - name: Upload OpenAPI Audit SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: >-
+          always() && steps.reports.outcome == 'success' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
-          sarif_file: openapi-results.sarif
+          sarif_file: reports/openapi-results.sarif
           category: compliance-openapi
-
       - name: Upload Documentation Audit SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
+        if: >-
+          always() && steps.reports.outcome == 'success' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          sarif_file: reports/docs-results.sarif
+          category: compliance-documentation
+      - name: Upload Log Audit SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: >-
+          always() && steps.reports.outcome == 'success' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          sarif_file: reports/logs-results.sarif
+          category: compliance-logs
+      - name: Stop Compliance Auditor Engine
+        if: always()
+        run: ./scripts/stop-auditor.sh
+
+  frontend-checks:
+    name: Frontend Build & Browser Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build production frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Install Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Verify production frontend
+        working-directory: frontend
+        env:
+          PLAYWRIGHT_PREVIEW: '1'
+        run: npm test
+      - name: Preserve browser traces and screenshots
+        uses: actions/upload-artifact@v7
         if: always()
         with:
-          sarif_file: docs-results.sarif
-          category: compliance-documentation
+          name: frontend-browser-results
+          path: frontend/test-results/
+          if-no-files-found: ignore

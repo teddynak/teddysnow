@@ -12,3 +12,8 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/.env.local
 !samples/system.log
+
+reports/
+
+__pycache__/
+*.pyc

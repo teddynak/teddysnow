@@ -22,38 +22,69 @@ on:
 
 permissions:
   contents: read
+  actions: read
   security-events: write
 
 jobs:
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MONGODB_URI: mongodb://localhost:27017/compliance_auditor_ci
+      PORT: '8080'
+      COMPLIANCE_SERVER: http://localhost:8080
     services:
       mongodb:
         image: mongo:7
         ports:
           - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping: 1}).ok ? 0 : 1)'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           java-version: '21'
           distribution: temurin
           cache: maven
+      - name: Build and test the auditor
+        working-directory: backend
+        run: ./mvnw -B -ntp clean verify
       - name: Start auditor API
-        run: |
-          cd backend
-          chmod +x mvnw
-          ./mvnw spring-boot:start
-          timeout 60 bash -c 'until curl -sf http://localhost:8080/api/health; do sleep 2; done'
+        run: ./scripts/start-auditor.sh
+      - name: Install report validator
+        run: python3 -m pip install -r scripts/requirements-ci.txt
       - name: Audit document
         run: |
           chmod +x cli/audit.sh
 ${command.split("\n").map(line => `          ${line}`).join("\n")}
-      - name: Upload SARIF
+      - name: Validate SARIF
+        id: sarif
         if: always() && hashFiles('results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        run: python3 scripts/validate-sarif.py results.sarif
+      - name: Preserve report and startup logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compliance-audit-results
+          path: |
+            results.sarif
+            reports/
+          if-no-files-found: ignore
+      - name: Upload SARIF
+        if: >-
+          always() && steps.sarif.outcome == 'success' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
           category: compliance-auditor
+      - name: Stop auditor API
+        if: always()
+        run: ./scripts/stop-auditor.sh
 `;
 }
