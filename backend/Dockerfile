@@ -15,7 +15,6 @@ WORKDIR /app
 
 COPY --from=build /app/target/*.jar app.jar
 
-ENV PORT=8080
-EXPOSE 8080
-
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# Render injects PORT at runtime; Spring Boot reads it via server.port=${PORT:8080}.
+# Free plan has 512 MB RAM, so cap the heap instead of relying on JVM ergonomics.
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]

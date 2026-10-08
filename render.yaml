@@ -1,0 +1,48 @@
+# Render Blueprint for the Structured Document Compliance Auditor backend.
+#
+# The backend is Spring Boot (Java 21). Render has no native Java runtime, so
+# this service builds from backend/Dockerfile via the Docker runtime.
+#
+# Manual setup if not using Blueprints:
+#   Runtime            -> Docker
+#   Root Directory     -> backend
+#   Dockerfile Path    -> ./Dockerfile
+#   Build Command      -> (empty)
+#   Pre-Deploy Command -> (empty)
+#   Start Command      -> (empty)
+#   Health Check Path  -> /api/health
+#
+# The frontend is a separate static site (see frontend/.env.example). Set its
+# VITE_API_BASE_URL to https://<this-service>.onrender.com/api, or leave it as
+# /api and add a reverse proxy in front of both.
+
+services:
+  - type: web
+    name: teddysnow
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    buildFilter:
+      paths:
+        - backend/**
+      ignoredPaths:
+        - cli/**
+        - samples/**
+        - scripts/**
+    envVars:
+      # Set to false, then paste your MongoDB Atlas connection string into the
+      # dashboard. The API cannot serve /api/* without it: the default points
+      # at localhost:27017, so requests hang until they time out.
+      - key: MONGODB_URI
+        sync: false
+      # Comma-separated allowed origins. Add your deployed frontend origin,
+      # otherwise the deployed UI is rejected by the CORS filter.
+      - key: CORS_ORIGINS
+        value: http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173
+      # PORT is injected by Render. Do not set it.
