@@ -59,12 +59,16 @@ npm run dev
 
 ## Frontend Configuration and Verification
 
-The frontend checks API health and loads rulebooks, scan history, and schema independently. Use **Refresh connection** after starting or reconnecting services. Uploads accept UTF-8 text documents up to 8 MB and run an audit immediately. The Studio can create, save, validate, and test drafts without saving them; validation uses the backend's Java regex and inheritance checks.
+The frontend checks API health and loads rulebooks, scan history, and schema independently. Connection diagnostics and **Refresh connection** are in **Settings → Workspace connection**. Uploads accept UTF-8 text documents up to 8 MB; disable **Audit after upload** to review files before scanning, including while disconnected. The Studio can create, save, validate, and test drafts without saving them; validation uses the backend's Java regex and inheritance checks.
+
+**Settings** includes dark, light, and system themes; comfortable or compact spacing; editor font size and line wrapping; upload behavior; default findings filter; and preferred report format. Preferences are saved in this browser. The connection URL can also be changed without rebuilding: switching servers clears the previous catalog and report while preserving your document. Reset preferences leaves the connection URL unchanged.
+
+The custom vector logo is `frontend/public/teddysnow-logo.svg`, also used as the favicon. Download it from Settings. **How it works** explains the document → rulebook → findings → report workflow and supports keyboard navigation. The layout spans the available screen with sidebar navigation on desktop and a compact navigation grid on phones.
 
 Copy `frontend/.env.example` to `frontend/.env.local` to customize the connection:
 
 - `API_PROXY_TARGET` configures the backend target for both Vite development and preview servers; default `http://localhost:8080`.
-- `VITE_API_BASE_URL` configures the browser API path at build time; default `/api`. A deployed frontend needs either a reverse proxy for `/api` or an absolute backend API URL such as `https://auditor.example/api`. For a separate origin, set the backend's `CORS_ORIGINS` to the frontend URL.
+- `VITE_API_BASE_URL` configures the initial browser API path at build time; a saved Settings connection URL takes precedence on that browser; default `/api`. A deployed frontend needs either a reverse proxy for `/api` or an absolute backend API URL such as `https://auditor.example/api`. For a separate origin, set the backend's `CORS_ORIGINS` to the frontend URL.
 
 ```bash
 cd frontend
@@ -75,7 +79,7 @@ npx playwright install chromium
 npm test
 ```
 
-The default browser suite verifies service failures, recovery, clipboard errors, duplicate submissions, and destructive-action wiring with controlled API responses. To also run real API checks for scanning, exports, history, uploads, studio save/update, inherited drafts, and responsive views, start a backend connected to an **isolated test database**, then run:
+The default browser suite verifies service failures, recovery, clipboard errors, duplicate submissions, destructive-action wiring, persistent preferences, connection switching, report defaults, upload review, help accessibility, and responsive dark/light layouts with controlled API responses. To also run real API checks for scanning, exports, history, uploads, studio save/update, inherited drafts, and responsive views, start a backend connected to an **isolated test database**, then run:
 
 ```bash
 AUDITOR_API_URL=http://localhost:8080 API_PROXY_TARGET=http://localhost:8080 npm test
@@ -83,7 +87,7 @@ AUDITOR_API_URL=http://localhost:8080 API_PROXY_TARGET=http://localhost:8080 npm
 
 To test the production build, run `npm run build` and add `PLAYWRIGHT_PREVIEW=1` to the browser test command. Development uses port 5173 and standalone preview uses 4173; both local origins are allowed by the backend defaults. Browser tests start their own server on 5173 and reject a port already used by another app. Set `PLAYWRIGHT_PORT` and the backend `CORS_ORIGINS` together if you need another test port.
 
-The live tests create and remove their own scan and rulebook records. Layout checks cover 320, 375, 768, 1024, and 1440 pixel widths. Browser screenshots and failure traces are written to `frontend/test-results/`. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use an existing Chromium or Chrome executable.
+The live tests create and remove their own scan and rulebook records. Layout checks cover 320, 375, 768, 1024, 1440, and 1920 pixel widths. Browser screenshots and failure traces are written to `frontend/test-results/`. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use an existing Chromium or Chrome executable.
 
 Run backend tests with Java 21 using `cd backend && ./mvnw test`.
 

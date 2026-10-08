@@ -8,6 +8,8 @@ import {
   getRulebookSchema,
   downloadScanReport,
   getHealth,
+  getApiBaseUrl,
+  setApiBaseUrl,
   validateRulebook,
   getScan,
   listRulebooks,
@@ -24,6 +26,9 @@ import {
   type ScanSummary,
   type Severity,
 } from "./api";
+import SettingsPanel from "./components/SettingsPanel";
+import HelpDialog from "./components/HelpDialog";
+import { usePreferences } from "./preferences";
 import { cliCommand, curlCommand, workflowYaml } from "./ci";
 import { SAMPLE_PRESETS, type SamplePreset } from "./samples";
 import {
@@ -50,12 +55,22 @@ import {
   Layers,
   GitBranch,
   Check,
+  Settings,
+  CircleHelp,
+  ArrowUpRight,
+  FileSearch,
+  ListChecks,
+  LoaderCircle,
 } from "lucide-react";
 
-type Tab = "auditor" | "rulebook" | "history" | "cicd";
+type Tab = "auditor" | "rulebook" | "history" | "cicd" | "settings";
 type StudioView = "editor" | "visual" | "schema";
 
 export default function App() {
+  const { preferences, updatePreferences, storageError } = usePreferences();
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [apiBaseUrl, setApiBaseUrlState] = useState(getApiBaseUrl);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("auditor");
   const [rulebooks, setRulebooks] = useState<Rulebook[]>([]);
   const [selectedRulebookId, setSelectedRulebookId] = useState<string>("");
@@ -80,7 +95,7 @@ export default function App() {
 
   // Interactive View Controls
   const [activeLine, setActiveLine] = useState<number | null>(null);
-  const [severityFilter, setSeverityFilter] = useState<string>("ALL");
+  const [severityFilter, setSeverityFilter] = useState<string>(preferences.defaultSeverity);
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [showOnlyViolations, setShowOnlyViolations] = useState<boolean>(false);
@@ -151,13 +166,26 @@ export default function App() {
     void runTask("Refreshing connection…", refreshCatalog);
   }
 
+  async function saveConnection(url: string): Promise<boolean> {
+    if (ruleJson && ruleJson !== JSON.stringify(selectedRulebook, null, 2) &&
+        !confirm("Changing the connection will discard unsaved rulebook changes. Continue?")) throw new Error("Connection change canceled.");
+    const normalized = setApiBaseUrl(url);
+    setApiBaseUrlState(normalized);
+    setApiStatus("checking"); setDatabaseStatus("checking"); setConnectionError(null);
+    setRulebooks([]); setHistory([]); setHistoryLoaded(false); setSelectedRulebookId("");
+    setRuleJson(""); setSchemaDoc(null); setScan(null); setActiveLine(null); draftMode.current = false;
+    let available = false;
+    await runTask("Checking connection…", async () => { available = await refreshCatalog(); });
+    return available;
+  }
+
   function notify(message: string) {
     clearTimeout(notificationTimer.current);
     setSuccessBanner(message);
     notificationTimer.current = setTimeout(() => setSuccessBanner(null), 4000);
   }
 
-  async function runTask(label: string, task: () => Promise<void>) {
+  async function runTask(label: string, task: () => Promise<unknown>) {
     if (taskRunning.current) return;
     taskRunning.current = true;
     setBusy(true);
@@ -207,7 +235,8 @@ export default function App() {
     if (schemaResult.status === "fulfilled") setSchemaDoc(schemaResult.value);
     const failures = results.flatMap((result, index) => result.status === "rejected"
       ? [`${["API health", "Rulebooks", "Scan history", "Rulebook schema"][index]}: ${result.reason instanceof Error ? result.reason.message : "Unavailable"}`] : []);
-    if (failures.length) setError(failures.join(" · "));
+    setConnectionError(failures.length ? failures.join(" · ") : null);
+    return healthResult.status === "fulfilled" && healthResult.value.status === "ok" && booksResult.status === "fulfilled" && scansResult.status === "fulfilled";
   }
 
   useEffect(() => {
@@ -260,7 +289,7 @@ export default function App() {
   }
 
   function resetResultFilters() {
-    setSeverityFilter("ALL"); setCategoryFilter("ALL"); setSearchQuery(""); setShowOnlyViolations(false);
+    setSeverityFilter(preferences.defaultSeverity); setCategoryFilter("ALL"); setSearchQuery(""); setShowOnlyViolations(false);
   }
 
   // Auto-scroll when active line changes
@@ -302,15 +331,18 @@ export default function App() {
     if (file) processUploadedFile(file);
   }
   function processUploadedFile(file: File) {
-    void runTask("Uploading and scanning…", async () => {
-      if (!selectedRulebookId) throw new Error("Select a saved rulebook before uploading a document.");
+    void runTask(preferences.autoScanUploads ? "Uploading and scanning…" : "Importing document…", async () => {
+      if (preferences.autoScanUploads && !selectedRulebookId) throw new Error("Select a saved rulebook before uploading a document, or turn off automatic auditing in Settings.");
       if (!/\.(log|txt|json|yaml|yml|md|csv|conf)$/i.test(file.name)) throw new Error("Choose a supported text file (.log, .txt, .md, .json, .yaml, .yml, .csv, .conf).");
       if (file.size > 8 * 1024 * 1024) throw new Error("The file is too large. Maximum upload size is 8 MB.");
-      const text = await file.text();
+      let text: string;
+      try { text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer()); }
+      catch { throw new Error("Upload a UTF-8 text document."); }
       if (!text.trim()) throw new Error("The uploaded document is empty.");
-      if (text.includes("\0") || text.includes("\ufffd")) throw new Error("Upload a UTF-8 text document.");
+      if (text.includes("\0")) throw new Error("Upload a UTF-8 text document.");
       setContent(text); setSourceName(file.name); setActivePresetId(""); setScan(null);
-      await executeScan(() => scanUpload(file, selectedRulebookId));
+      if (preferences.autoScanUploads) await executeScan(() => scanUpload(file, selectedRulebookId));
+      else { setActiveLine(null); resetResultFilters(); notify(`Imported ${file.name}. Review the document, then run an audit.`); }
     });
   }
 
@@ -480,6 +512,7 @@ export default function App() {
   // Global Keyboard Shortcuts (Ctrl/Cmd+Enter: Audit, Alt+N: Next Violation, Alt+P: Prev Violation)
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (helpOpen) return;
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
         if (!taskRunning.current && tab === "auditor") triggerScan();
@@ -493,7 +526,7 @@ export default function App() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [busy, tab, content, selectedRulebookId, sourceName, violatingLineNumbers, activeLine]);
+  }, [busy, tab, content, selectedRulebookId, sourceName, violatingLineNumbers, activeLine, preferences.defaultSeverity, helpOpen]);
 
   // Filtered Findings
   const filteredFindings = useMemo(() => {
@@ -517,92 +550,47 @@ export default function App() {
   return (
     <div className="shell">
       <a className="skip-link" href="#main-content">Skip to workspace</a>
-      {/* Masthead */}
       <header className="masthead">
-        <div className="brand">
-          <div className="brand-icon">
-            <ShieldCheck size={28} />
-          </div>
-          <div>
-            <p className="kicker">TeddySnow Compliance Suite</p>
-            <h1>Structured Document Compliance Auditor</h1>
-            <p className="lede">
-              Scan open source framework documentation, system logs, and API schemas against strict
-              JSON rulebooks with line-by-line violation highlighting.
-            </p>
-          </div>
-        </div>
-        <div className="header-status">
-          <span className="status-badge">
-            <span className={`status-dot ${databaseStatus}`}></span>
-            {databaseStatus === "connected" ? "Database connected" : databaseStatus === "checking" ? "Checking database…" : "Database unavailable"}
-          </span>
-          <span className="status-badge">
-            <Code2 size={13} />
-            {apiStatus === "connected" ? "API online" : apiStatus === "checking" ? "Checking API…" : "API unavailable"}
-          </span>
-          <span className="status-badge">
-            <BookOpen size={13} />
-            {rulebooks.length} Active Rulebooks
-          </span>
+        <button className="brand" onClick={() => setTab("auditor")} aria-label="TeddySnow audit workspace">
+          <img src="/teddysnow-logo.svg" className="brand-logo" width="42" height="42" alt=""/>
+          <span className="brand-wordmark">Teddy<span>Snow</span><small>DOCUMENT AUDITOR</small></span>
+        </button>
+        <div className="header-actions">
+          <span className="product-label">Clarity in every document.</span>
+          <button className="btn header-help" aria-label="How it works" onClick={() => setHelpOpen(true)}><CircleHelp size={17}/><span>How it works</span></button>
+          <button className={`btn header-settings ${tab === "settings" ? "selected" : ""}`} onClick={() => setTab("settings")} aria-label="Open settings"><Settings size={18}/></button>
         </div>
       </header>
-
-      {/* Tabs Navigation */}
-      <nav className="nav-bar" aria-label="Main navigation">
-        <div className="tabs">
-          <button
-            className={`tab-btn ${tab === "auditor" ? "active" : ""}`}
-            aria-current={tab === "auditor" ? "page" : undefined}
-            onClick={() => setTab("auditor")}
-          >
-            <FileText size={16} />
-            Auditor Workspace
-          </button>
-          <button
-            className={`tab-btn ${tab === "rulebook" ? "active" : ""}`}
-            aria-current={tab === "rulebook" ? "page" : undefined}
-            onClick={() => setTab("rulebook")}
-          >
-            <BookOpen size={16} />
-            JSON Rulebook & Schema Studio
-          </button>
-          <button
-            className={`tab-btn ${tab === "history" ? "active" : ""}`}
-            aria-current={tab === "history" ? "page" : undefined}
-            onClick={() => setTab("history")}
-          >
-            <History size={16} />
-            Scan History
-            <span className="tab-badge">{history.length}</span>
-          </button>
-          <button
-            className={`tab-btn ${tab === "cicd" ? "active" : ""}`}
-            aria-current={tab === "cicd" ? "page" : undefined}
-            onClick={() => setTab("cicd")}
-          >
-            <Terminal size={16} />
-            CI/CD & CLI
-          </button>
-        </div>
-
-        {tab === "auditor" && scan && (
-          <div className="btn-group nav-export-group">
-            <button className="btn btn-sm btn-primary" onClick={() => exportReport("sarif")} title="Export standard OASIS SARIF v2.1.0 for GitHub Code Scanning">
-              <Download size={14} />
-              <span>Export SARIF</span>
-            </button>
-            <button className="btn btn-sm" onClick={() => exportReport("markdown")}>
-              <Download size={14} />
-              <span>Markdown</span>
-            </button>
-            <button className="btn btn-sm" onClick={() => exportReport("json")}>
-              <Download size={14} />
-              <span>JSON</span>
-            </button>
+      <div className="app-layout">
+        <aside className="sidebar">
+          <p className="sidebar-label">WORKSPACE</p>
+          <nav className="tabs" aria-label="Main navigation">
+            {[
+              { id: "auditor", name: "Audit workspace", accessible: "Auditor Workspace", icon: FileText },
+              { id: "rulebook", name: "Rulebook studio", accessible: "JSON Rulebook & Schema Studio", icon: BookOpen },
+              { id: "history", name: "Scan history", accessible: "Scan History", icon: History },
+              { id: "cicd", name: "CI / automation", accessible: "CI/CD & CLI", icon: Terminal },
+              { id: "settings", name: "Settings", accessible: "Settings", icon: Settings },
+            ].map(item => <button key={item.id} className={`tab-btn ${tab === item.id ? "active" : ""}`} aria-label={item.accessible} aria-current={tab === item.id ? "page" : undefined} onClick={() => setTab(item.id as Tab)}><item.icon size={18}/><span>{item.name}</span>{item.id === "history" && history.length > 0 && <span className="tab-badge">{history.length}</span>}</button>)}
+          </nav>
+          <div className="sidebar-guide"><div className="guide-icon"><ListChecks size={20}/></div><h2>From findings to fixes.</h2><p>Bring a document. Choose a policy. Leave with a clearer next step.</p><button onClick={() => setHelpOpen(true)}>Explore the workflow<ArrowUpRight size={14}/></button></div>
+          <div className="sidebar-footer"><span className="footer-monogram">TS</span><div>TeddySnow<small>Compliance coursework</small></div></div>
+        </aside>
+        <div className="app-content">
+          <div className="page-heading">
+            <div><p className="eyebrow">{tab === "auditor" ? "DOCUMENT REVIEW" : tab === "rulebook" ? "POLICY MANAGEMENT" : tab === "history" ? "YOUR AUDIT TRAIL" : tab === "cicd" ? "CONNECTED WORKFLOWS" : "YOUR WORKSPACE"}</p>
+              <h1>{{ auditor: "Audit workspace", rulebook: "Rulebook studio", history: "Scan history", cicd: "CI & automation", settings: "Settings" }[tab]}</h1>
+              <p>{{ auditor: "Turn complex documents into clear, actionable findings.", rulebook: "Shape the standards your documents are measured against.", history: "Revisit your reviews and pick up where you left off.", cicd: "Bring document checks into your development workflow.", settings: "A workspace that works the way you do." }[tab]}</p>
+            </div>
+            {tab === "auditor" && scan && <div className="report-actions">
+              <button className="btn btn-primary" disabled={busy} onClick={() => exportReport(preferences.defaultExport)}><Download size={15}/>Download report</button>
+              <div className="btn-group nav-export-group">
+                <button className="btn btn-sm" disabled={busy} onClick={() => exportReport("sarif")} title="Export OASIS SARIF 2.1.0">Export SARIF</button>
+                <button className="btn btn-sm" disabled={busy} onClick={() => exportReport("markdown")}>Markdown</button>
+                <button className="btn btn-sm" disabled={busy} onClick={() => exportReport("json")}>JSON</button>
+              </div>
+            </div>}
           </div>
-        )}
-      </nav>
 
       {/* Alert Banners */}
       {error && (
@@ -622,10 +610,8 @@ export default function App() {
         </div>
       )}
 
-      <div className="connection-toolbar">
-        <span role="status" aria-live="polite">{busy ? operationLabel : databaseStatus === "connected" ? "Catalog ready" : "Start the API and MongoDB, then refresh the connection."}</span>
-        <button className="btn btn-sm" disabled={busy} onClick={refreshConnection}><RotateCcw size={14} />Refresh connection</button>
-      </div>
+      {busy && <div className="operation-state" role="status"><LoaderCircle size={15}/>{operationLabel}</div>}
+      {!busy && !rulebooks.length && (tab === "auditor" || tab === "rulebook") && <div className="workspace-notice"><CircleHelp size={18}/><span>Your document is ready to edit. Connect your workspace to start auditing.</span><button className="btn btn-sm" onClick={() => setTab("settings")}>Connection settings<ArrowUpRight size={14}/></button></div>}
       <main id="main-content" aria-busy={busy}>
       <fieldset className="workspace-controls" disabled={busy}>
       <legend className="sr-only">Workspace controls</legend>
@@ -637,7 +623,7 @@ export default function App() {
             <div className="panel-title">
               <h2>
                 <FileCode size={18} />
-                Source Record Input
+                Document source
               </h2>
               <span className="status-badge">
                 {content.split("\n").length} lines · {content.length} chars
@@ -647,8 +633,8 @@ export default function App() {
             {/* Presets Chips */}
             <div className="presets-section">
               <div className="section-label">
-                <span>Standard Test Record Presets</span>
-                <span>Quick Pick</span>
+                <span>Start with an example</span>
+                <span>EXAMPLES</span>
               </div>
               <div className="preset-chips">
                 {SAMPLE_PRESETS.map((preset) => (
@@ -685,7 +671,7 @@ export default function App() {
               onDrop={handleDrop}
               tabIndex={busy ? -1 : 0}
               role="button"
-              aria-label="Upload and audit a text document"
+              aria-label={preferences.autoScanUploads ? "Upload and audit a text document" : "Import a text document"}
               aria-disabled={busy}
               onKeyDown={event => {
                 if (!busy && (event.key === "Enter" || event.key === " ")) {
@@ -702,10 +688,10 @@ export default function App() {
               <div className="dropzone-inner">
                 <UploadCloud size={28} />
                 <span className="dropzone-text">
-                  Drag & drop text record or log file here, or click to browse
+                  Drop a document here, or browse files
                 </span>
                 <span className="dropzone-sub">
-                  UTF-8 text · .log, .txt, .md, .json, .yaml, .yml, .csv, .conf · up to 8 MB · scans immediately
+                  UTF-8 · TXT, MD, LOG, JSON, YAML, CSV, CONF · up to 8 MB
                 </span>
               </div>
             </label>
@@ -729,7 +715,7 @@ export default function App() {
                 </select>
               </div>
               <div className="form-group">
-                <label htmlFor="source-name">Source Record Identifier</label>
+                <label htmlFor="source-name">Document name</label>
                 <input
                   id="source-name"
                   type="text"
@@ -796,16 +782,13 @@ export default function App() {
           {/* Right Column: Results & Line Highlighting */}
           <section className="panel">
             {!scan ? (
-              <div style={{ textAlign: "center", padding: "64px 20px" }}>
-                <ShieldCheck size={48} style={{ color: "var(--muted)", margin: "0 auto 16px" }} />
-                <h3 style={{ margin: "0 0 8px", color: "#fff" }}>Ready to Audit</h3>
-                <p style={{ color: "var(--muted)", maxWidth: "42ch", margin: "0 auto 20px" }}>
-                  Select a rulebook and click <strong>Audit Document</strong> to scan for outdated
-                  API versions, missing validation flags, and deprecated tags.
-                </p>
-                <button className="btn btn-primary" disabled={busy || !content.trim() || !selectedRulebookId} onClick={triggerScan}>
-                  Run Compliance Scan
-                </button>
+              <div className="results-empty">
+                <div className="panel-title"><h2><ListChecks size={18}/>Audit results</h2><span className="badge-cat">AWAITING REVIEW</span></div>
+                <div className="results-empty-hero"><div className="results-illustration"><FileSearch size={56}/><span><Check size={18}/></span></div><p className="eyebrow">A CLEARER PICTURE</p><h3>See what needs attention.</h3><p>Review your document against a rulebook. Every finding includes the line, the reason, and a practical next step.</p>
+                  <button className="btn btn-primary" disabled={busy || !content.trim() || !selectedRulebookId} onClick={triggerScan}><ShieldCheck size={16}/>Run Compliance Scan</button>
+                </div>
+                <div className="audit-flow"><div><span>01</span><strong>Add a document</strong><small>Paste, upload, or use an example.</small></div><div><span>02</span><strong>Choose a rulebook</strong><small>Select the standards to check.</small></div><div><span>03</span><strong>Review & resolve</strong><small>Inspect findings and export a report.</small></div></div>
+                <div className="review-scope"><p className="section-label">WHAT A RULEBOOK CAN CHECK</p><div><span><CheckCircle2 size={14}/>Version requirements</span><span><CheckCircle2 size={14}/>Input validation</span><span><CheckCircle2 size={14}/>Deprecated patterns</span><span><CheckCircle2 size={14}/>Transport & metadata</span></div></div>
               </div>
             ) : (
               <div>
@@ -1483,7 +1466,7 @@ export default function App() {
                   {history.map((item) => (
                     <tr key={item.id} className="history-tr">
                       <td className="history-td">
-                        <strong style={{ color: "#fff", display: "flex", alignItems: "center", gap: "6px" }}>
+                        <strong style={{ color: "var(--ink)", display: "flex", alignItems: "center", gap: "6px" }}>
                           <FileText size={15} />
                           {item.sourceName}
                         </strong>
@@ -1668,7 +1651,7 @@ export default function App() {
                   {copiedCiSnippet === "cli" ? "Copied!" : "Copy Command"}
                 </button>
               </div>
-              <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "13px", color: "#86efac" }}>
+              <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "13px", color: "var(--pass)" }}>
                 <code>{generatedCli}</code>
               </pre>
             </div>
@@ -1688,7 +1671,7 @@ export default function App() {
                   {copiedCiSnippet === "curl" ? "Copied!" : "Copy cURL"}
                 </button>
               </div>
-              <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "12.5px", color: "#93c5fd" }}>
+              <pre style={{ margin: 0, padding: "12px", background: "var(--panel-elevated)", borderRadius: "6px", border: "1px solid var(--line)", overflowX: "auto", fontSize: "12.5px", color: "var(--accent)" }}>
                 <code>{generatedCurl}</code>
               </pre>
             </div>
@@ -1721,7 +1704,12 @@ export default function App() {
         </div>
       )}
       </fieldset>
+      {tab === "settings" && <SettingsPanel preferences={preferences} onChange={updatePreferences} storageError={storageError} apiBaseUrl={apiBaseUrl} onSaveConnection={saveConnection} onRefreshConnection={refreshConnection} apiStatus={apiStatus} databaseStatus={databaseStatus} connectionError={connectionError} busy={busy} onShowHelp={() => setHelpOpen(true)}/>}
       </main>
+      <footer className="content-footer"><span>TeddySnow · Document compliance, made clear.</span><button onClick={() => setHelpOpen(true)}>About this workspace<ArrowUpRight size={13}/></button></footer>
+      </div>
+      </div>
+      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)}/>}
     </div>
   );
 }

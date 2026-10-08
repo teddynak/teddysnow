@@ -105,13 +105,34 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); this.name = "ApiError"; }
 }
 
-export const API = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+export const DEFAULT_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+const CONNECTION_KEY = "teddysnow.api-base-url.v1";
+export function normalizeApiBaseUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed || /[\s\\?#]/.test(trimmed)) throw new Error("Enter /api or a full HTTP(S) API URL without spaces, query parameters, or a fragment.");
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error();
+    return url.toString().replace(/\/+$/, "");
+  } catch { throw new Error("Enter /api or a full HTTP(S) API URL, such as https://your-server.example/api."); }
+}
+export function getApiBaseUrl(): string {
+  try { return normalizeApiBaseUrl(localStorage.getItem(CONNECTION_KEY) || DEFAULT_API_BASE_URL); }
+  catch { return DEFAULT_API_BASE_URL; }
+}
+export function setApiBaseUrl(value: string): string {
+  const normalized = normalizeApiBaseUrl(value);
+  try { localStorage.setItem(CONNECTION_KEY, normalized); }
+  catch { throw new Error("Browser storage is unavailable. The connection could not be saved."); }
+  return normalized;
+}
 
 async function checkedResponse<T>(path: string, init: RequestInit | undefined, read: (response: Response) => Promise<T>): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(`${API}${path}`, { ...init, signal: controller.signal });
+    const response = await fetch(`${getApiBaseUrl()}${path}`, { ...init, signal: controller.signal });
     if (!response.ok) {
       let message = `Request failed (${response.status})`;
       if (response.status === 413) message = "The file is too large. Maximum upload size is 8 MB.";
@@ -174,6 +195,6 @@ export const deleteScan = (id: string) => request<void>(`/scans/${idPath(id)}`, 
 export const clearAllScans = () => request<void>("/scans", { method: "DELETE" });
 export const getSarifExport = (id: string) => request<Record<string, unknown>>(`/scans/${idPath(id)}/sarif`);
 export const exportScanUrl = (id: string, format: "sarif" | "markdown" | "json") =>
-  `${API}/scans/${idPath(id)}/export?format=${format}`;
+  `${getApiBaseUrl()}/scans/${idPath(id)}/export?format=${format}`;
 export const downloadScanReport = async (id: string, format: "sarif" | "markdown" | "json") =>
   checkedResponse(`/scans/${idPath(id)}/export?format=${format}`, undefined, response => response.blob());

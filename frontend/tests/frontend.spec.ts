@@ -9,7 +9,7 @@ test.afterEach(() => expect(pageErrors).toEqual([]));
 
 async function ready(page: Page) {
   await page.goto("/");
-  await expect(page.getByText("Catalog ready", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Audit Document", exact: true })).toBeEnabled();
 }
 async function audit(page: Page) {
   const response = page.waitForResponse(res => res.url().endsWith("/api/scans") && res.request().method() === "POST");
@@ -32,9 +32,12 @@ test("unavailable services show accurate status and retry recovers", async ({ pa
     return route.fulfill({ json: path.endsWith("/health") ? { status: "ok" } : path.endsWith("/schema") ? { type: "object", properties: {} } : path.endsWith("/effective") ? book : path.endsWith("/rulebooks") ? [book] : [] });
   });
   await page.goto("/");
-  await expect(page.getByText("Database unavailable", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Audit Document", exact: true })).toBeDisabled();
-  await expect(page.getByRole("alert")).toContainText("Test backend unavailable");
+  await expect(page.locator("header")).not.toContainText("unavailable");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByText("Database unavailable", { exact: true })).toBeVisible();
+  await page.getByText("Connection details", { exact: true }).click();
+  await expect(page.locator(".connection-details")).toContainText("Test backend unavailable");
   available = true;
   await page.getByRole("button", { name: "Refresh connection" }).click();
   await expect(page.getByText("Database connected", { exact: true })).toBeVisible();
@@ -75,6 +78,12 @@ test.describe("live backend", () => {
 
   test("scan, filters, exports, history, and stale-result feedback", async ({ page }) => {
     await ready(page);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByLabel("API base URL").fill(`${process.env.AUDITOR_API_URL}/api`);
+    await page.getByRole("button", { name: "Save connection" }).click();
+    await expect(page.getByRole("status")).toHaveText("Connection saved and checked.");
+    await expect(page.getByText("API online", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Auditor Workspace", exact: true }).click();
     await audit(page);
     await expect(page.locator(".violation-mark").first()).toBeVisible();
     await page.getByRole("button", { name: /^Warnings \(/ }).click();
@@ -100,9 +109,9 @@ test.describe("live backend", () => {
 
   test("phone, tablet, and desktop layouts fit every tab and studio view", async ({ page }, testInfo) => {
     await ready(page); await audit(page);
-    for (const width of [320, 375, 768, 1024, 1440]) {
+    for (const width of [320, 375, 768, 1024, 1440, 1920]) {
       await page.setViewportSize({ width, height: 900 });
-      for (const name of ["Auditor Workspace", "JSON Rulebook & Schema Studio", "Scan History", "CI/CD & CLI"]) {
+      for (const name of ["Auditor Workspace", "JSON Rulebook & Schema Studio", "Scan History", "CI/CD & CLI", "Settings"]) {
         await page.getByRole("button", { name, exact: name !== "Scan History" }).first().click();
         await fits(page);
         if (name.includes("Studio")) {
@@ -184,8 +193,10 @@ test("catalog failures are independent and a missing schema disables copy", asyn
   await page.route("**/api/scans", route => route.fulfill({ status: 503, json: { error: "History temporarily unavailable" } }));
   await page.route("**/api/rulebooks/schema", route => route.fulfill({ status: 503, json: { error: "Schema temporarily unavailable" } }));
   await page.goto("/");
-  await expect(page.getByRole("alert")).toContainText("History temporarily unavailable");
   await expect(page.getByRole("button", { name: "Audit Document", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByText("Connection details", { exact: true }).click();
+  await expect(page.locator(".connection-details")).toContainText("History temporarily unavailable");
   await page.getByRole("button", { name: "JSON Rulebook & Schema Studio" }).click();
   await page.getByRole("button", { name: "Schema Spec", exact: true }).click();
   await expect(page.getByRole("button", { name: "Copy Schema", exact: true })).toBeDisabled();
@@ -242,7 +253,10 @@ test("delete, clear-history, and reset controls send their intended requests", a
   await expect(page.getByText("No scans recorded yet. Run an audit from the workspace.")).toBeVisible();
   expect(requests).toContain("DELETE /api/scans/fixture-scan");
   history = [record];
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Refresh connection" }).click();
+  await expect(page.locator("fieldset")).toBeEnabled();
+  await page.getByRole("button", { name: /Scan History/ }).click();
   await page.getByRole("button", { name: "Clear All Scans", exact: true }).click();
   await expect(page.getByText("No scans recorded yet. Run an audit from the workspace.")).toBeVisible();
   expect(requests).toContain("DELETE /api/scans");

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">TeddySnow</title>
+  <desc id="desc">A document shield with a T monogram and a snow crystal.</desc>
+  <defs><linearGradient id="brand" x1="10" y1="4" x2="54" y2="61" gradientUnits="userSpaceOnUse"><stop stop-color="#7c7bff"/><stop offset="1" stop-color="#20c8dd"/></linearGradient></defs>
+  <path d="M32 3 55 12v21c0 14-10 23-23 29C19 56 9 47 9 33V12L32 3Z" fill="url(#brand)"/>
+  <path d="M32 7 51 15v18c0 11-8 19-19 25-11-6-19-14-19-25V15L32 7Z" fill="#101a30" fill-opacity=".24"/>
+  <path d="M20 22h23M31.5 22v22" stroke="white" stroke-width="5" stroke-linecap="round"/>
+  <path d="m44 36 4 4 7-8" stroke="#c4ffef" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M44 9v10m-4.3-7.5 8.6 5m0-5-8.6 5" stroke="#dcfaff" stroke-width="1.5" stroke-linecap="round"/>
+</svg>
